@@ -1,16 +1,21 @@
-"""Lead ingestion (CSV/JSON) and LLM-based enrichment (cold email generation)."""
+"""Lead ingestion (CSV/JSON) and LLM-based enrichment (cold email generation).
+Enrichment is always queued to Celery - the request path never blocks on an
+LLM call."""
 import csv
 import io
 import logging
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import ValidationError
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import limiter, require_admin
 from app.database import get_db
-from app.models import EmailMessage, Lead, LeadStatus, MessageDirection, MessageStatus
+from app.models import Lead, LeadStatus
 from app.schemas import LeadIn, LeadOut, LeadUploadPayload
-from app.services.llm import get_llm_client
+from app.tasks.celery_tasks import batch_enrich_leads_task, enrich_lead_task
+from app.tasks.dispatch import enqueue
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/leads", tags=["leads"])
@@ -43,32 +48,32 @@ def _parse_csv(raw: bytes) -> list[LeadIn]:
     return leads
 
 
-def _persist_leads(leads_in: list[LeadIn], db: Session) -> list[Lead]:
+async def _persist_leads(leads_in: list[LeadIn], db: AsyncSession) -> list[Lead]:
     if not leads_in:
         raise HTTPException(status_code=422, detail="No leads found in payload")
 
     created: list[Lead] = []
     for lead_in in leads_in:
-        existing = db.query(Lead).filter(Lead.email.ilike(lead_in.email)).first()
+        existing = (await db.execute(select(Lead).where(Lead.email.ilike(lead_in.email)))).scalar_one_or_none()
         if existing:
             continue
         lead = Lead(**lead_in.model_dump())
         db.add(lead)
         created.append(lead)
-    db.commit()
+    await db.commit()
     for lead in created:
-        db.refresh(lead)
+        await db.refresh(lead)
     return created
 
 
 @router.post("/upload", response_model=list[LeadOut])
-def upload_leads_json(payload: LeadUploadPayload, db: Session = Depends(get_db)):
+async def upload_leads_json(payload: LeadUploadPayload, db: AsyncSession = Depends(get_db)):
     """Accept a JSON body {"leads": [...]} of target leads."""
-    return _persist_leads(payload.leads, db)
+    return await _persist_leads(payload.leads, db)
 
 
 @router.post("/upload/file", response_model=list[LeadOut])
-async def upload_leads_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_leads_file(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
     """Accept a CSV or JSON file upload of target leads."""
     raw = await file.read()
     if file.filename and file.filename.lower().endswith(".json"):
@@ -81,61 +86,44 @@ async def upload_leads_file(file: UploadFile = File(...), db: Session = Depends(
         leads_in = LeadUploadPayload(leads=data.get("leads", data if isinstance(data, list) else [])).leads
     else:
         leads_in = _parse_csv(raw)
-    return _persist_leads(leads_in, db)
+    return await _persist_leads(leads_in, db)
 
 
 @router.get("", response_model=list[LeadOut])
-def list_leads(status: LeadStatus | None = None, db: Session = Depends(get_db)):
-    query = db.query(Lead)
+async def list_leads(status: LeadStatus | None = None, db: AsyncSession = Depends(get_db)):
+    query = select(Lead)
     if status:
-        query = query.filter(Lead.status == status)
-    return query.order_by(Lead.created_at.desc()).all()
+        query = query.where(Lead.status == status)
+    result = await db.execute(query.order_by(Lead.created_at.desc()))
+    return result.scalars().all()
 
 
 @router.get("/{lead_id}", response_model=LeadOut)
-def get_lead(lead_id: str, db: Session = Depends(get_db)):
-    lead = db.get(Lead, lead_id)
+async def get_lead(lead_id: str, db: AsyncSession = Depends(get_db)):
+    lead = await db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     return lead
 
 
-@router.post("/{lead_id}/enrich")
-def enrich_lead(lead_id: str, db: Session = Depends(get_db)):
-    """Generate a personalized cold email draft for a lead via the LLM."""
-    lead = db.get(Lead, lead_id)
+@router.post("/{lead_id}/enrich", status_code=202)
+@limiter.limit("30/minute")
+async def enrich_lead(request: Request, lead_id: str, db: AsyncSession = Depends(get_db)):
+    """Queue LLM-based cold email generation for a lead (async - returns a task ID)."""
+    lead = await db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    task_id = enqueue(enrich_lead_task, lead.id)
+    return {"lead_id": lead.id, "task_id": task_id, "status": "queued"}
 
-    llm = get_llm_client()
-    try:
-        generated = llm.generate_cold_email(
-            {
-                "company_name": lead.company_name,
-                "contact_name": lead.contact_name,
-                "website": lead.website,
-                "linkedin_url": lead.linkedin_url,
-            }
-        )
-    except Exception as exc:  # noqa: BLE001 - malformed JSON, rate limits, or provider errors
-        logger.error("Enrichment failed for lead %s: %s", lead_id, exc)
-        raise HTTPException(status_code=502, detail=f"LLM failed to produce email copy: {exc}") from exc
 
-    message = EmailMessage(
-        lead_id=lead.id,
-        direction=MessageDirection.OUTBOUND,
-        sequence_step=0,
-        subject=generated["subject"],
-        body=generated["body"],
-        status=MessageStatus.DRAFT,
-    )
-    db.add(message)
-    lead.status = LeadStatus.ENRICHED
-    db.commit()
-    db.refresh(message)
-    return {
-        "message_id": message.id,
-        "lead_id": lead.id,
-        "subject": message.subject,
-        "body": message.body,
-    }
+@router.post("/enrich/batch", status_code=202, dependencies=[Depends(require_admin)])
+@limiter.limit("10/minute")
+async def enrich_leads_batch(request: Request, status: LeadStatus = LeadStatus.NEW, db: AsyncSession = Depends(get_db)):
+    """Queue batch enrichment for every lead currently in `status` (default: new)."""
+    result = await db.execute(select(Lead.id).where(Lead.status == status))
+    lead_ids = [row[0] for row in result.all()]
+    if not lead_ids:
+        return {"queued": 0, "task_id": None}
+    task_id = enqueue(batch_enrich_leads_task, lead_ids)
+    return {"queued": len(lead_ids), "task_id": task_id}

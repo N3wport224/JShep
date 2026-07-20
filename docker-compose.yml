@@ -1,4 +1,43 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sdr-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sdr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sdr}
+      POSTGRES_DB: ${POSTGRES_DB:-sdr}
+    volumes:
+      - sdr_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sdr}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: sdr-redis
+    restart: unless-stopped
+    volumes:
+      - sdr_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    build: .
+    container_name: sdr-migrate
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
   sdr-backend:
     build: .
     container_name: ai-sdr-backend
@@ -7,10 +46,11 @@ services:
       - "${APP_PORT:-8000}:8000"
     env_file:
       - .env
-    environment:
-      - DATABASE_URL=sqlite:////data/sdr.db
-    volumes:
-      - sdr_data:/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -18,5 +58,32 @@ services:
       start_period: 10s
       retries: 3
 
+  celery-worker:
+    build: .
+    container_name: sdr-celery-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
+
+  celery-beat:
+    build: .
+    container_name: sdr-celery-beat
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=info"]
+
 volumes:
-  sdr_data:
+  sdr_postgres_data:
+  sdr_redis_data:

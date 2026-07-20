@@ -73,3 +73,32 @@ class ApprovalRequestOut(BaseModel):
 
 class ApprovalDecision(BaseModel):
     edited_response: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Structured LLM output schemas. Every agentic LLM call in app.services.llm
+# validates its JSON response against one of these before accepting it; a
+# ValidationError triggers an automatic self-correction retry that feeds the
+# error back to the model rather than surfacing malformed data to callers.
+# ---------------------------------------------------------------------------
+
+
+class ColdEmailDraft(BaseModel):
+    subject: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=4000)
+
+
+class SentimentClassification(BaseModel):
+    sentiment: Sentiment
+    reasoning: str = Field(default="", max_length=500)
+
+
+class ReplyDraft(BaseModel):
+    draft: str = Field(min_length=1, max_length=4000)
+    reasoning: str = Field(default="", max_length=500)
+
+
+class ReplyCritique(BaseModel):
+    approved: bool
+    revised_draft: Optional[str] = Field(default=None, max_length=4000)
+    critique: str = Field(default="", max_length=500)

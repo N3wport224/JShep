@@ -2,31 +2,35 @@
 LLM orchestration layer. Wraps whichever provider is configured
 (Anthropic or OpenAI) behind a single interface used by the rest of the
 app for: cold email generation, reply sentiment classification, and
-draft-reply generation for the human-in-the-loop approval gate.
+agentic draft-reply generation for the human-in-the-loop approval gate.
 
-All calls that expect structured output ask the model for JSON and are
-wrapped in retry logic that tolerates rate limits and malformed JSON.
+Every structured call validates its JSON response against a Pydantic model
+(app.schemas) and, on a validation failure, retries with the validation
+error fed back to the model as automated self-correction - separate from
+the tenacity-driven retry/circuit-breaker layer that handles transport
+failures and rate limits.
 """
 import json
 import logging
-from typing import Literal
+from typing import TypeVar
 
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from pydantic import BaseModel, ValidationError
 
 from app.config import get_settings
-from app.models import Sentiment
+from app.core.metrics import llm_calls_total, record_llm_tokens
+from app.core.resilience import RateLimitedError, get_circuit_breaker, resilient_retry
+from app.schemas import ColdEmailDraft, ReplyCritique, ReplyDraft, SentimentClassification
 
 logger = logging.getLogger(__name__)
 
-SENTIMENT_VALUES = [s.value for s in Sentiment]
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+MAX_SELF_CORRECTION_ATTEMPTS = 3
 
 
 class LLMJSONError(Exception):
-    """Raised when the LLM response could not be parsed as valid JSON after retries."""
-
-
-class LLMRateLimitError(Exception):
-    """Raised when the upstream provider signals a rate limit that retries could not resolve."""
+    """Raised when the LLM response could not be parsed/validated as the
+    expected structured output after all self-correction retries."""
 
 
 def _extract_json(text: str) -> dict:
@@ -53,6 +57,7 @@ class LLMClient:
     def __init__(self):
         self.settings = get_settings()
         self.provider = self.settings.llm_provider
+        self._breaker = get_circuit_breaker(f"llm:{self.provider}", failure_threshold=5, recovery_timeout_seconds=30)
         if self.provider == "anthropic":
             if not self.settings.anthropic_api_key:
                 logger.warning("ANTHROPIC_API_KEY is not set; LLM calls will fail until configured.")
@@ -68,13 +73,9 @@ class LLMClient:
         else:
             raise ValueError(f"Unsupported LLM provider: {self.provider}")
 
-    @retry(
-        reraise=True,
-        stop=stop_after_attempt(4),
-        wait=wait_exponential(multiplier=1, min=2, max=30),
-        retry=retry_if_exception_type((LLMRateLimitError, ConnectionError)),
-    )
+    @resilient_retry(retryable_exceptions=(RateLimitedError, ConnectionError, TimeoutError))
     def _complete(self, system: str, user: str, max_tokens: int = 1024) -> str:
+        self._breaker.before_call()
         try:
             if self.provider == "anthropic":
                 response = self._client.messages.create(
@@ -83,7 +84,10 @@ class LLMClient:
                     system=system,
                     messages=[{"role": "user", "content": user}],
                 )
-                return response.content[0].text
+                text = response.content[0].text
+                record_llm_tokens(
+                    self.provider, response.usage.input_tokens, response.usage.output_tokens
+                )
             else:
                 response = self._client.chat.completions.create(
                     model=self.settings.openai_model,
@@ -93,38 +97,69 @@ class LLMClient:
                         {"role": "user", "content": user},
                     ],
                 )
-                return response.choices[0].message.content
+                text = response.choices[0].message.content
+                usage = response.usage
+                record_llm_tokens(
+                    self.provider,
+                    getattr(usage, "prompt_tokens", 0) or 0,
+                    getattr(usage, "completion_tokens", 0) or 0,
+                )
         except Exception as exc:  # provider SDKs raise their own rate-limit types
+            self._breaker.on_failure()
             message = str(exc).lower()
             if "rate limit" in message or "429" in message or "overloaded" in message:
-                raise LLMRateLimitError(str(exc)) from exc
+                raise RateLimitedError(str(exc)) from exc
             raise
+        else:
+            self._breaker.on_success()
+            return text
 
-    def _complete_json(self, system: str, user: str, max_tokens: int = 1024) -> dict:
+    def _complete_structured(
+        self, system: str, user: str, schema: type[SchemaT], operation: str, max_tokens: int = 1024
+    ) -> SchemaT:
+        """Call the LLM and validate the response against `schema`. On a JSON
+        or Pydantic validation failure, feeds the exact error back to the
+        model and retries (self-correction) up to MAX_SELF_CORRECTION_ATTEMPTS
+        times before giving up."""
         last_error: Exception | None = None
-        for attempt in range(3):
-            raw = self._complete(system, user, max_tokens=max_tokens)
+        current_user = user
+        for attempt in range(MAX_SELF_CORRECTION_ATTEMPTS):
+            raw = self._complete(system, current_user, max_tokens=max_tokens)
             try:
-                return _extract_json(raw)
-            except LLMJSONError as exc:
+                data = _extract_json(raw)
+                validated = schema.model_validate(data)
+            except (LLMJSONError, ValidationError) as exc:
                 last_error = exc
-                logger.warning("LLM JSON parse failed (attempt %s/3): %s", attempt + 1, exc)
-                user = (
-                    f"{user}\n\nYour previous reply was not valid JSON. "
-                    "Respond with ONLY a single valid JSON object, no markdown, no commentary."
+                logger.warning(
+                    "LLM structured output failed validation for %s (attempt %s/%s): %s",
+                    operation,
+                    attempt + 1,
+                    MAX_SELF_CORRECTION_ATTEMPTS,
+                    exc,
                 )
-        raise last_error or LLMJSONError("LLM did not return valid JSON")
+                llm_calls_total.labels(provider=self.provider, operation=operation, outcome="json_error").inc()
+                current_user = (
+                    f"{user}\n\nYour previous response was invalid: {exc}\n"
+                    f"Respond with ONLY a single valid JSON object matching this schema: "
+                    f"{schema.model_json_schema()}"
+                )
+                continue
+            else:
+                llm_calls_total.labels(provider=self.provider, operation=operation, outcome="success").inc()
+                return validated
+
+        llm_calls_total.labels(provider=self.provider, operation=operation, outcome="provider_error").inc()
+        raise LLMJSONError(
+            f"LLM did not return valid {schema.__name__} after {MAX_SELF_CORRECTION_ATTEMPTS} attempts: {last_error}"
+        )
 
     # ------------------------------------------------------------------
-    # Public API
+    # Single-shot structured calls
     # ------------------------------------------------------------------
 
-    def generate_cold_email(self, lead: dict) -> dict:
+    def generate_cold_email(self, lead: dict) -> ColdEmailDraft:
         """Generate a personalized cold email for a lead.
-
-        `lead` is a dict with company_name, contact_name, website, linkedin_url.
-        Returns {"subject": str, "body": str}.
-        """
+        `lead` is a dict with company_name, contact_name, website, linkedin_url."""
         system = (
             "You are an expert SDR copywriter. Write concise, highly personalized "
             "B2B cold outreach emails. Never use generic templates or filler. "
@@ -139,12 +174,9 @@ class LLMClient:
             f"Website: {lead.get('website') or 'unknown'}\n"
             f"LinkedIn: {lead.get('linkedin_url') or 'unknown'}\n"
         )
-        data = self._complete_json(system, user)
-        if "subject" not in data or "body" not in data:
-            raise LLMJSONError(f"LLM cold email JSON missing required keys: {data}")
-        return data
+        return self._complete_structured(system, user, ColdEmailDraft, operation="generate_cold_email")
 
-    def generate_follow_up_email(self, lead: dict, step: int, previous_body: str) -> dict:
+    def generate_follow_up_email(self, lead: dict, step: int, previous_body: str) -> ColdEmailDraft:
         system = (
             "You are an expert SDR copywriter writing a brief, friendly follow-up "
             "to a cold email that received no reply. Do not repeat the first email "
@@ -155,12 +187,9 @@ class LLMClient:
             f"This is follow-up #{step} to {lead.get('contact_name')} at {lead.get('company_name')}.\n"
             f"Original email body:\n{previous_body}\n"
         )
-        data = self._complete_json(system, user)
-        if "subject" not in data or "body" not in data:
-            raise LLMJSONError(f"LLM follow-up email JSON missing required keys: {data}")
-        return data
+        return self._complete_structured(system, user, ColdEmailDraft, operation="generate_follow_up_email")
 
-    def classify_sentiment(self, reply_text: str) -> Literal["positive_interested", "objection", "negative_opt_out"]:
+    def classify_sentiment(self, reply_text: str) -> SentimentClassification:
         system = (
             "You classify inbound sales email replies into exactly one of three "
             "categories: positive_interested, objection, negative_opt_out. "
@@ -172,30 +201,66 @@ class LLMClient:
             "\"reasoning\": short string}."
         )
         user = f"Classify this reply:\n\n{reply_text}"
-        data = self._complete_json(system, user, max_tokens=256)
-        sentiment = data.get("sentiment")
-        if sentiment not in SENTIMENT_VALUES:
-            raise LLMJSONError(f"LLM returned invalid sentiment value: {sentiment!r}")
-        return sentiment
+        return self._complete_structured(system, user, SentimentClassification, operation="classify_sentiment", max_tokens=256)
 
-    def draft_reply(self, lead: dict, reply_text: str) -> str:
-        """Draft a proposed response to a positive/interested reply.
-        This draft is NEVER sent automatically - it is only shown to a human
-        in the approval gate."""
+    # ------------------------------------------------------------------
+    # Agentic reply drafting (multi-step: draft -> self-critique -> finalize)
+    # See generate_agentic_reply below for the full loop with thread memory.
+    # ------------------------------------------------------------------
+
+    def draft_reply(self, lead: dict, thread_context: str) -> ReplyDraft:
+        """Draft a proposed response to a positive/interested reply, given
+        the full thread context (not just the latest message). This draft is
+        NEVER sent automatically - it is only ever shown to a human in the
+        approval gate."""
         system = (
             "You are an SDR assistant drafting a reply to a prospect who responded "
-            "positively to cold outreach. Be warm, concise, and propose concrete next "
-            "steps (e.g. a call). Under 100 words, plain text. "
-            "Respond with ONLY a JSON object: {\"draft\": string}."
+            "positively to cold outreach. Read the full conversation thread below "
+            "(oldest first) and write a warm, concise reply that acknowledges prior "
+            "context and proposes concrete next steps (e.g. a call). Under 100 words, "
+            "plain text. Respond with ONLY a JSON object: "
+            "{\"draft\": string, \"reasoning\": string}."
         )
         user = (
-            f"Prospect: {lead.get('contact_name')} at {lead.get('company_name')}\n"
-            f"Their reply:\n{reply_text}\n"
+            f"Prospect: {lead.get('contact_name')} at {lead.get('company_name')}\n\n"
+            f"Conversation thread so far:\n{thread_context}\n"
         )
-        data = self._complete_json(system, user)
-        draft = data.get("draft")
-        if not draft:
-            raise LLMJSONError(f"LLM draft reply JSON missing 'draft' key: {data}")
+        return self._complete_structured(system, user, ReplyDraft, operation="draft_reply")
+
+    def critique_reply(self, lead: dict, thread_context: str, draft: str) -> ReplyCritique:
+        """Second agentic step: have the model critique its own draft against
+        the full thread before it's shown to a human, catching things like
+        repeating a question the prospect already answered."""
+        system = (
+            "You are a meticulous SDR reply reviewer. Given a conversation thread and "
+            "a drafted reply, check for: repeating something already said, ignoring a "
+            "question the prospect asked, over-promising, or being too pushy. If the "
+            "draft is fine, approve it. If not, provide a revised draft. Respond with "
+            "ONLY a JSON object: {\"approved\": bool, \"revised_draft\": string or null, "
+            "\"critique\": string}."
+        )
+        user = (
+            f"Prospect: {lead.get('contact_name')} at {lead.get('company_name')}\n\n"
+            f"Conversation thread so far:\n{thread_context}\n\n"
+            f"Drafted reply to review:\n{draft}\n"
+        )
+        return self._complete_structured(system, user, ReplyCritique, operation="critique_reply")
+
+    def generate_agentic_reply(self, lead: dict, thread_context: str, max_steps: int | None = None) -> ReplyDraft:
+        """Multi-step agentic loop: draft, then repeatedly self-critique and
+        revise until the critique step approves or max_steps is reached.
+        Always returns a ReplyDraft - the caller still routes it through the
+        human approval gate before anything is sent."""
+        max_steps = max_steps or self.settings.llm_agentic_max_steps
+        draft = self.draft_reply(lead, thread_context)
+
+        for step in range(max_steps - 1):
+            critique = self.critique_reply(lead, thread_context, draft.draft)
+            if critique.approved or not critique.revised_draft:
+                break
+            logger.info("Agentic reply loop step %d: revising draft (%s)", step + 1, critique.critique)
+            draft = ReplyDraft(draft=critique.revised_draft, reasoning=critique.critique)
+
         return draft
 
 

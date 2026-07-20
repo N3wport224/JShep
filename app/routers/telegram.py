@@ -3,13 +3,12 @@
 import logging
 
 import httpx
-from fastapi import APIRouter, Depends, Request
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.config import get_settings
+from app.core.security import limiter
 from app.database import get_db
-from app.models import ApprovalRequest
-from app.routers.approvals import _execute_decision
+from app.routers.approvals import resolve_decision
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/telegram", tags=["telegram"])
@@ -27,7 +26,8 @@ def _answer_callback(callback_query_id: str, text: str) -> None:
 
 
 @router.post("/webhook")
-async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
+@limiter.limit(get_settings().rate_limit_webhook)
+async def telegram_webhook(request: Request, db=Depends(get_db)):
     update = await request.json()
     callback = update.get("callback_query")
     if not callback:
@@ -40,14 +40,12 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
         return {"ok": True}
 
     action, approval_id, token = parts
-    approval = db.get(ApprovalRequest, approval_id)
-    if not approval:
-        _answer_callback(callback["id"], "Approval request not found")
-        return {"ok": True}
-
     try:
-        _execute_decision(db, approval, token, action)
+        await resolve_decision(db, approval_id, token, action)
         _answer_callback(callback["id"], f"{action.title()}d")
+    except HTTPException as exc:
+        logger.error("Failed to execute Telegram approval decision: %s", exc.detail)
+        _answer_callback(callback["id"], f"Error: {exc.detail}")
     except Exception as exc:  # noqa: BLE001 - always ack the callback, never raise into Telegram
         logger.error("Failed to execute Telegram approval decision: %s", exc)
         _answer_callback(callback["id"], f"Error: {exc}")

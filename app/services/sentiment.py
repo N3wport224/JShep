@@ -1,8 +1,10 @@
 """
 Sentiment triage pipeline: classifies an inbound Reply, and for
-Positive/Interested replies, creates an ApprovalRequest and fires a
-human-in-the-loop notification. This is the ONLY path that can produce an
-outbound reply to a prospect, and it always stops at the approval gate.
+Positive/Interested replies, runs a multi-step agentic drafting loop (using
+the lead's full conversation memory) to produce a proposed response, then
+creates an ApprovalRequest and fires a human-in-the-loop notification. This
+is the ONLY path that can produce an outbound reply to a prospect, and it
+always stops at the approval gate.
 """
 import logging
 
@@ -10,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.models import ApprovalRequest, Lead, LeadStatus, Reply, Sentiment
 from app.services.llm import get_llm_client
+from app.services.memory import build_thread_context, record_inbound
 from app.services.notifier import notify_approval_request
 
 logger = logging.getLogger(__name__)
@@ -19,8 +22,10 @@ def triage_reply(db: Session, reply: Reply) -> Reply:
     lead: Lead = reply.lead
     llm = get_llm_client()
 
+    record_inbound(db, lead, reply.raw_subject, reply.raw_body, source_reply_id=reply.id)
+
     try:
-        sentiment_value = llm.classify_sentiment(reply.raw_body)
+        classification = llm.classify_sentiment(reply.raw_body)
     except Exception as exc:  # noqa: BLE001 - malformed JSON, rate limits, or provider errors
         logger.error("Sentiment classification failed for reply %s: %s", reply.id, exc)
         # Fail safe: leave sentiment unset rather than guessing, so it can be
@@ -28,7 +33,7 @@ def triage_reply(db: Session, reply: Reply) -> Reply:
         db.commit()
         return reply
 
-    reply.sentiment = Sentiment(sentiment_value)
+    reply.sentiment = classification.sentiment
 
     if reply.sentiment == Sentiment.NEGATIVE:
         lead.status = LeadStatus.OPTED_OUT
@@ -53,10 +58,13 @@ def _open_approval_gate(db: Session, lead: Lead, reply: Reply) -> ApprovalReques
         "website": lead.website,
         "linkedin_url": lead.linkedin_url,
     }
+    thread_context = build_thread_context(db, lead)
+
     try:
-        draft = llm.draft_reply(lead_dict, reply.raw_body)
+        agentic_draft = llm.generate_agentic_reply(lead_dict, thread_context)
+        draft = agentic_draft.draft
     except Exception as exc:  # noqa: BLE001 - malformed JSON, rate limits, or provider errors
-        logger.error("Draft reply generation failed for lead %s: %s", lead.id, exc)
+        logger.error("Agentic draft reply generation failed for lead %s: %s", lead.id, exc)
         draft = (
             "[AI draft generation failed - please write a manual reply before approving.]"
         )
