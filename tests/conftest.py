@@ -8,7 +8,6 @@ Env vars are set *before* importing anything under app/, since
 app.database / app.db_sync build their engines at import time from cached
 settings.
 """
-import asyncio
 import os
 import uuid
 from pathlib import Path
@@ -25,7 +24,7 @@ os.environ.setdefault("LOG_JSON", "false")
 os.environ.setdefault("ADMIN_API_KEY", "test-admin-key")
 
 from app.database import Base, engine  # noqa: E402
-from app.db_sync import sync_engine  # noqa: E402
+from app.db_sync import sync_engine  # noqa: E402,F401 - import validates the sync engine builds cleanly
 
 
 @pytest.fixture(scope="session", autouse=True)

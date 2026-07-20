@@ -4,7 +4,7 @@ from typing import Optional
 
 from pydantic import BaseModel, EmailStr, Field
 
-from app.models import ApprovalStatus, LeadStatus, MessageStatus, Sentiment
+from app.models import ApprovalStatus, LeadStatus, MessageStatus, Sentiment, SuppressionSource
 
 
 class LeadIn(BaseModel):
@@ -17,6 +17,7 @@ class LeadIn(BaseModel):
 
 class LeadUploadPayload(BaseModel):
     leads: list[LeadIn] = Field(default_factory=list)
+    campaign_id: Optional[str] = None
 
 
 class LeadOut(BaseModel):
@@ -29,6 +30,9 @@ class LeadOut(BaseModel):
     status: LeadStatus
     follow_up_step: int
     next_follow_up_at: Optional[datetime]
+    campaign_id: Optional[str]
+    variant_id: Optional[str]
+    crm_contact_id: Optional[str]
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -102,3 +106,72 @@ class ReplyCritique(BaseModel):
     approved: bool
     revised_draft: Optional[str] = Field(default=None, max_length=4000)
     critique: str = Field(default="", max_length=500)
+
+
+class MeetingIntent(BaseModel):
+    wants_to_book: bool
+    reasoning: str = Field(default="", max_length=300)
+
+
+# ---------------------------------------------------------------------------
+# Suppression list
+# ---------------------------------------------------------------------------
+
+
+class SuppressionEntryIn(BaseModel):
+    email: EmailStr
+    reason: Optional[str] = None
+
+
+class SuppressionEntryOut(BaseModel):
+    id: str
+    email: str
+    domain: str
+    reason: Optional[str]
+    source: SuppressionSource
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# A/B campaign testing
+# ---------------------------------------------------------------------------
+
+
+class CampaignVariantIn(BaseModel):
+    label: str = Field(min_length=1, max_length=50)
+    prompt_hint: Optional[str] = Field(default=None, max_length=1000)
+    weight: int = Field(default=1, ge=1)
+
+
+class CampaignIn(BaseModel):
+    name: str
+    description: Optional[str] = None
+    variants: list[CampaignVariantIn] = Field(min_length=2)
+
+
+class CampaignVariantOut(BaseModel):
+    id: str
+    label: str
+    prompt_hint: Optional[str]
+    weight: int
+    sent_count: int
+    open_count: int
+    reply_count: int
+    positive_count: int
+    open_rate: float
+    reply_rate: float
+    positive_rate: float
+
+    model_config = {"from_attributes": True}
+
+
+class CampaignOut(BaseModel):
+    id: str
+    name: str
+    description: Optional[str]
+    created_at: datetime
+    variants: list[CampaignVariantOut]
+
+    model_config = {"from_attributes": True}

@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import limiter, require_admin
 from app.database import get_db
-from app.models import Lead, LeadStatus
+from app.models import Campaign, Lead, LeadStatus
 from app.schemas import LeadIn, LeadOut, LeadUploadPayload
 from app.tasks.celery_tasks import batch_enrich_leads_task, enrich_lead_task
 from app.tasks.dispatch import enqueue
@@ -48,16 +48,19 @@ def _parse_csv(raw: bytes) -> list[LeadIn]:
     return leads
 
 
-async def _persist_leads(leads_in: list[LeadIn], db: AsyncSession) -> list[Lead]:
+async def _persist_leads(leads_in: list[LeadIn], db: AsyncSession, campaign_id: str | None = None) -> list[Lead]:
     if not leads_in:
         raise HTTPException(status_code=422, detail="No leads found in payload")
+
+    if campaign_id and not await db.get(Campaign, campaign_id):
+        raise HTTPException(status_code=404, detail=f"Campaign {campaign_id!r} not found")
 
     created: list[Lead] = []
     for lead_in in leads_in:
         existing = (await db.execute(select(Lead).where(Lead.email.ilike(lead_in.email)))).scalar_one_or_none()
         if existing:
             continue
-        lead = Lead(**lead_in.model_dump())
+        lead = Lead(**lead_in.model_dump(), campaign_id=campaign_id)
         db.add(lead)
         created.append(lead)
     await db.commit()
@@ -68,13 +71,17 @@ async def _persist_leads(leads_in: list[LeadIn], db: AsyncSession) -> list[Lead]
 
 @router.post("/upload", response_model=list[LeadOut])
 async def upload_leads_json(payload: LeadUploadPayload, db: AsyncSession = Depends(get_db)):
-    """Accept a JSON body {"leads": [...]} of target leads."""
-    return await _persist_leads(payload.leads, db)
+    """Accept a JSON body {"leads": [...], "campaign_id": "..."} of target leads.
+    campaign_id (optional) enrolls every lead into that A/B test campaign."""
+    return await _persist_leads(payload.leads, db, campaign_id=payload.campaign_id)
 
 
 @router.post("/upload/file", response_model=list[LeadOut])
-async def upload_leads_file(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
-    """Accept a CSV or JSON file upload of target leads."""
+async def upload_leads_file(
+    file: UploadFile = File(...), campaign_id: str | None = None, db: AsyncSession = Depends(get_db)
+):
+    """Accept a CSV or JSON file upload of target leads. Pass ?campaign_id=
+    to enroll every lead into that A/B test campaign."""
     raw = await file.read()
     if file.filename and file.filename.lower().endswith(".json"):
         import json
@@ -86,7 +93,7 @@ async def upload_leads_file(file: UploadFile = File(...), db: AsyncSession = Dep
         leads_in = LeadUploadPayload(leads=data.get("leads", data if isinstance(data, list) else [])).leads
     else:
         leads_in = _parse_csv(raw)
-    return await _persist_leads(leads_in, db)
+    return await _persist_leads(leads_in, db, campaign_id=campaign_id)
 
 
 @router.get("", response_model=list[LeadOut])

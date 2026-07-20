@@ -10,9 +10,10 @@ from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.metrics import variant_open_total
 from app.core.security import require_admin
 from app.database import get_db
-from app.models import EmailMessage, Lead, LeadStatus, MessageStatus, SenderAccount
+from app.models import CampaignVariant, EmailMessage, Lead, LeadStatus, MessageStatus, SenderAccount
 
 router = APIRouter(prefix="/tracking", tags=["tracking"])
 
@@ -33,6 +34,11 @@ async def track_open(tracking_id: str, db: AsyncSession = Depends(get_db)):
         lead = await db.get(Lead, message.lead_id)
         if lead and lead.status == LeadStatus.SENT:
             lead.status = LeadStatus.OPENED
+        if lead and lead.variant_id:
+            variant = await db.get(CampaignVariant, lead.variant_id)
+            if variant:
+                variant.open_count += 1
+                variant_open_total.labels(campaign=variant.campaign.name, variant=variant.label).inc()
         await db.commit()
     return Response(content=_PIXEL_BYTES, media_type="image/png")
 

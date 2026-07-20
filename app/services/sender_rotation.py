@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.core.metrics import email_dispatch_total, sender_bounce_rate
 from app.core.resilience import RateLimitedError, get_circuit_breaker, resilient_retry
-from app.models import MessageStatus, SenderAccount, SenderProvider
+from app.models import SenderAccount, SenderProvider
 from app.services.email_sender import EmailSendError, send_email_smtp
 
 logger = logging.getLogger(__name__)

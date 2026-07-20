@@ -19,7 +19,7 @@ from pydantic import BaseModel, ValidationError
 from app.config import get_settings
 from app.core.metrics import llm_calls_total, record_llm_tokens
 from app.core.resilience import RateLimitedError, get_circuit_breaker, resilient_retry
-from app.schemas import ColdEmailDraft, ReplyCritique, ReplyDraft, SentimentClassification
+from app.schemas import ColdEmailDraft, MeetingIntent, ReplyCritique, ReplyDraft, SentimentClassification
 
 logger = logging.getLogger(__name__)
 
@@ -157,9 +157,13 @@ class LLMClient:
     # Single-shot structured calls
     # ------------------------------------------------------------------
 
-    def generate_cold_email(self, lead: dict) -> ColdEmailDraft:
+    def generate_cold_email(self, lead: dict, variant_hint: str | None = None) -> ColdEmailDraft:
         """Generate a personalized cold email for a lead.
-        `lead` is a dict with company_name, contact_name, website, linkedin_url."""
+        `lead` is a dict with company_name, contact_name, website, linkedin_url.
+        `variant_hint` (optional) is an A/B campaign variant's prompt_hint -
+        e.g. a requested subject-line style or angle - so each variant
+        produces a distinguishable email rather than converging on the same
+        copy every time."""
         system = (
             "You are an expert SDR copywriter. Write concise, highly personalized "
             "B2B cold outreach emails. Never use generic templates or filler. "
@@ -174,6 +178,8 @@ class LLMClient:
             f"Website: {lead.get('website') or 'unknown'}\n"
             f"LinkedIn: {lead.get('linkedin_url') or 'unknown'}\n"
         )
+        if variant_hint:
+            user += f"\nA/B test variant instruction - follow this angle/style: {variant_hint}\n"
         return self._complete_structured(system, user, ColdEmailDraft, operation="generate_cold_email")
 
     def generate_follow_up_email(self, lead: dict, step: int, previous_body: str) -> ColdEmailDraft:
@@ -203,12 +209,25 @@ class LLMClient:
         user = f"Classify this reply:\n\n{reply_text}"
         return self._complete_structured(system, user, SentimentClassification, operation="classify_sentiment", max_tokens=256)
 
+    def detect_meeting_intent(self, reply_text: str) -> MeetingIntent:
+        """Does this reply ask to schedule/book a call or meeting? Used to
+        decide whether to hand the agentic drafting loop a calendar booking
+        link (app.services.calendar) to include in its response."""
+        system = (
+            "You determine whether an inbound sales reply is asking to schedule "
+            "a call, demo, or meeting (e.g. \"can we hop on a call\", \"send me your "
+            "calendar\", \"when are you free\"). Respond with ONLY a JSON object: "
+            "{\"wants_to_book\": bool, \"reasoning\": short string}."
+        )
+        user = f"Reply:\n\n{reply_text}"
+        return self._complete_structured(system, user, MeetingIntent, operation="detect_meeting_intent", max_tokens=200)
+
     # ------------------------------------------------------------------
     # Agentic reply drafting (multi-step: draft -> self-critique -> finalize)
     # See generate_agentic_reply below for the full loop with thread memory.
     # ------------------------------------------------------------------
 
-    def draft_reply(self, lead: dict, thread_context: str) -> ReplyDraft:
+    def draft_reply(self, lead: dict, thread_context: str, booking_url: str | None = None) -> ReplyDraft:
         """Draft a proposed response to a positive/interested reply, given
         the full thread context (not just the latest message). This draft is
         NEVER sent automatically - it is only ever shown to a human in the
@@ -225,9 +244,15 @@ class LLMClient:
             f"Prospect: {lead.get('contact_name')} at {lead.get('company_name')}\n\n"
             f"Conversation thread so far:\n{thread_context}\n"
         )
+        if booking_url:
+            user += (
+                f"\nThe prospect wants to schedule a call/meeting. Include this "
+                f"booking link naturally in the reply so they can pick a time "
+                f"themselves: {booking_url}\n"
+            )
         return self._complete_structured(system, user, ReplyDraft, operation="draft_reply")
 
-    def critique_reply(self, lead: dict, thread_context: str, draft: str) -> ReplyCritique:
+    def critique_reply(self, lead: dict, thread_context: str, draft: str, booking_url: str | None = None) -> ReplyCritique:
         """Second agentic step: have the model critique its own draft against
         the full thread before it's shown to a human, catching things like
         repeating a question the prospect already answered."""
@@ -244,18 +269,27 @@ class LLMClient:
             f"Conversation thread so far:\n{thread_context}\n\n"
             f"Drafted reply to review:\n{draft}\n"
         )
+        if booking_url:
+            user += (
+                f"\nThe prospect wants to schedule a call - verify the draft includes "
+                f"this booking link, and add it if missing: {booking_url}\n"
+            )
         return self._complete_structured(system, user, ReplyCritique, operation="critique_reply")
 
-    def generate_agentic_reply(self, lead: dict, thread_context: str, max_steps: int | None = None) -> ReplyDraft:
+    def generate_agentic_reply(
+        self, lead: dict, thread_context: str, max_steps: int | None = None, booking_url: str | None = None
+    ) -> ReplyDraft:
         """Multi-step agentic loop: draft, then repeatedly self-critique and
         revise until the critique step approves or max_steps is reached.
         Always returns a ReplyDraft - the caller still routes it through the
-        human approval gate before anything is sent."""
+        human approval gate before anything is sent. `booking_url` is passed
+        through when app.services.llm.detect_meeting_intent found the
+        prospect asking to schedule a call."""
         max_steps = max_steps or self.settings.llm_agentic_max_steps
-        draft = self.draft_reply(lead, thread_context)
+        draft = self.draft_reply(lead, thread_context, booking_url=booking_url)
 
         for step in range(max_steps - 1):
-            critique = self.critique_reply(lead, thread_context, draft.draft)
+            critique = self.critique_reply(lead, thread_context, draft.draft, booking_url=booking_url)
             if critique.approved or not critique.revised_draft:
                 break
             logger.info("Agentic reply loop step %d: revising draft (%s)", step + 1, critique.critique)

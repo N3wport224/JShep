@@ -20,12 +20,14 @@ from app.models import (
     Reply,
     SenderAccount,
 )
+from app.services.campaigns import assign_variant, record_sent
 from app.services.email_sender import EmailSendError
 from app.services.imap_listener import IMAPListenerError, fetch_new_replies
 from app.services.llm import LLMJSONError, get_llm_client
 from app.services.memory import record_outbound
 from app.services.sender_rotation import NoHealthySenderError, send_via_rotation
 from app.services.sentiment import triage_reply
+from app.services.suppression import is_suppressed, unsubscribe_footer
 from app.tasks.dispatch import with_request_context
 
 logger = get_logger(__name__)
@@ -45,6 +47,14 @@ def enrich_lead_task(self, lead_id: str) -> dict:
             logger.warning("enrich_lead_task: lead not found", lead_id=lead_id)
             return {"lead_id": lead_id, "status": "not_found"}
 
+        if is_suppressed(db, lead.email):
+            logger.info("enrich_lead_task: lead is suppressed, skipping", lead_id=lead_id)
+            lead.status = LeadStatus.OPTED_OUT
+            db.commit()
+            return {"lead_id": lead_id, "status": "suppressed"}
+
+        variant = assign_variant(db, lead)
+
         llm = get_llm_client()
         try:
             generated = llm.generate_cold_email(
@@ -53,7 +63,8 @@ def enrich_lead_task(self, lead_id: str) -> dict:
                     "contact_name": lead.contact_name,
                     "website": lead.website,
                     "linkedin_url": lead.linkedin_url,
-                }
+                },
+                variant_hint=variant.prompt_hint if variant else None,
             )
         except LLMJSONError as exc:
             logger.error("enrich_lead_task: LLM failed", lead_id=lead_id, error=str(exc))
@@ -64,13 +75,13 @@ def enrich_lead_task(self, lead_id: str) -> dict:
             direction=MessageDirection.OUTBOUND,
             sequence_step=0,
             subject=generated.subject,
-            body=generated.body,
+            body=generated.body + unsubscribe_footer(lead),
             status=MessageStatus.DRAFT,
         )
         db.add(message)
         lead.status = LeadStatus.ENRICHED
         db.commit()
-        logger.info("lead_enriched", lead_id=lead_id, message_id=message.id)
+        logger.info("lead_enriched", lead_id=lead_id, message_id=message.id, variant=variant.label if variant else None)
         return {"lead_id": lead_id, "message_id": message.id, "status": "enriched"}
     finally:
         db.close()
@@ -98,6 +109,14 @@ def send_email_task(self, message_id: str) -> dict:
             return {"message_id": message_id, "status": str(message.status)}
 
         lead: Lead = message.lead
+
+        if is_suppressed(db, lead.email):
+            logger.info("send_email_task: lead is suppressed, skipping send", message_id=message_id, lead_id=lead.id)
+            message.status = MessageStatus.FAILED
+            lead.status = LeadStatus.OPTED_OUT
+            db.commit()
+            return {"message_id": message_id, "status": "suppressed"}
+
         message.status = MessageStatus.QUEUED
         db.commit()
 
@@ -139,6 +158,7 @@ def send_email_task(self, message_id: str) -> dict:
         message.sent_at = datetime.utcnow()
         lead.status = LeadStatus.SENT
         record_outbound(db, lead, message.subject, message.body, source_email_message_id=message.id)
+        record_sent(db, lead)
 
         if message.sequence_step == 0:
             arm_first_follow_up(get_settings(), lead)
@@ -211,6 +231,13 @@ def follow_up_sequence_task() -> dict:
         )
         llm = get_llm_client()
         for lead in due_leads:
+            if is_suppressed(db, lead.email):
+                logger.info("follow_up_sequence_task: lead is suppressed, skipping", lead_id=lead.id)
+                lead.status = LeadStatus.OPTED_OUT
+                lead.next_follow_up_at = None
+                db.commit()
+                continue
+
             last_message = (
                 db.query(EmailMessage)
                 .filter(
@@ -238,7 +265,7 @@ def follow_up_sequence_task() -> dict:
                 direction=MessageDirection.OUTBOUND,
                 sequence_step=step,
                 subject=generated.subject,
-                body=generated.body,
+                body=generated.body + unsubscribe_footer(lead),
                 status=MessageStatus.DRAFT,
             )
             db.add(message)
@@ -300,6 +327,13 @@ def send_approved_reply_task(self, approval_id: str) -> dict:
 
         lead: Lead = approval.lead
         reply: Reply = approval.reply
+
+        if is_suppressed(db, lead.email):
+            logger.info("send_approved_reply_task: lead is suppressed, skipping send", approval_id=approval_id)
+            approval.status = ApprovalStatus.REJECTED
+            db.commit()
+            return {"approval_id": approval_id, "status": "suppressed"}
+
         final_body = approval.edited_response or approval.drafted_response
         subject = f"Re: {reply.raw_subject}" if reply.raw_subject else "Re: your reply"
 

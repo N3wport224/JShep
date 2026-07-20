@@ -100,6 +100,15 @@ class Settings(BaseSettings):
     rate_limit_default: str = "60/minute"
     rate_limit_webhook: str = "120/minute"
 
+    # --- CRM integration: push Positive/Interested leads automatically ---
+    crm_provider: Literal["none", "hubspot"] = "none"
+    hubspot_access_token: Optional[str] = None
+
+    # --- Calendar / meeting scheduling ---
+    # A static booking link (Cal.com or a Google Calendar appointment
+    # schedule link both work) offered to prospects who ask to book a call.
+    calendar_booking_url: Optional[str] = None
+
 
 @lru_cache
 def get_settings() -> Settings:

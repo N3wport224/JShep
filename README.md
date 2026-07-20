@@ -55,23 +55,32 @@ app/
     telegram.py                         Telegram inline-button callback receiver
     dashboard.py                         Admin-authenticated HTML approval dashboard
     auth.py                              JWT issuance (POST /auth/token)
+    suppression.py                       Suppression list admin API + public unsubscribe
+    campaigns.py                         A/B campaign CRUD + per-variant stats
   services/
     llm.py                    Anthropic/OpenAI wrapper: structured output validation
-                                with self-correction retries, agentic reply loop
+                                with self-correction retries, agentic reply loop,
+                                meeting-intent detection
     email_sender.py             Low-level SMTP dispatch (used by sender_rotation)
     sender_rotation.py            Multi-account sender pool, provider abstraction
                                     (SMTP/Instantly/Smartlead), bounce/health tracking
     imap_listener.py                IMAP polling + reply matching + body parsing
-    sentiment.py                      Sentiment triage -> agentic draft -> approval gate
+    sentiment.py                      Sentiment triage -> agentic draft -> approval gate;
+                                        also triggers CRM sync + suppression on the way
     memory.py                          Per-lead conversation memory (ThreadMessage)
     notifier.py                         Telegram / Discord / generic webhook fan-out
+    suppression.py                       Global do-not-contact list + unsubscribe footer
+    crm.py                                 CRM contact push (HubSpot)
+    calendar.py                              Booking-link lookup for meeting requests
+    campaigns.py                               A/B variant assignment + metric tracking
   tasks/
     celery_tasks.py            All background task bodies (enrich, send, poll, triage,
                                  follow-up sequence, bounce health check)
     dispatch.py                  enqueue() / request-ID propagation into tasks
 alembic/                 Database migrations (source of truth for schema)
 tests/                    pytest suite (LLM self-correction, IMAP parsing quirks,
-                            approval race conditions, circuit breaker, bounce auto-pause)
+                            approval race conditions, circuit breaker, bounce auto-pause,
+                            suppression enforcement, CRM sync, A/B assignment/metrics)
 ```
 
 ### Request/task flow
@@ -90,18 +99,23 @@ tests/                    pytest suite (LLM self-correction, IMAP parsing quirks
 5. Triage classifies sentiment (`positive_interested` / `objection` /
    `negative_opt_out`) via a Pydantic-validated LLM call with automatic
    self-correction retries on malformed JSON.
-6. **`positive_interested` replies never auto-reply.** The system runs a
+6. **`positive_interested` replies never auto-reply.** The system checks
+   whether the prospect asked to schedule a call (`detect_meeting_intent`),
+   pushes the lead to the configured CRM (`app.services.crm`), then runs a
    multi-step agentic loop (draft -> self-critique -> revise, using the
-   lead's *entire* conversation thread as context, not just the latest
-   message) and creates a `PENDING` `ApprovalRequest`, then pushes an
-   interactive notification (Telegram inline buttons, and/or a Discord/
-   generic webhook message with Approve/Reject links) containing the
-   prospect's message and the AI draft.
+   lead's *entire* conversation thread as context, and a calendar booking
+   link if a meeting was requested) and creates a `PENDING`
+   `ApprovalRequest`, then pushes an interactive notification (Telegram
+   inline buttons, and/or a Discord/generic webhook message with
+   Approve/Reject links) containing the prospect's message and the AI draft.
 7. A human resolves the decision via `GET/POST /approvals/{id}/decision`
    (or the Telegram/Discord button/link). This transition is a single
    **atomic conditional UPDATE** (`WHERE status = 'pending'`), so two
    concurrent clicks can't both succeed - the loser gets `409`. Only after
-   that commits does `send_approved_reply_task` get queued to actually send.
+   that commits does `send_approved_reply_task` get queued to actually send
+   (still gated by the suppression check below).
+8. A **`negative_opt_out`** reply immediately adds the lead's email *and
+   domain* to the global suppression list - see Compliance below.
 
 ## Resilience
 
@@ -128,20 +142,78 @@ tests/                    pytest suite (LLM self-correction, IMAP parsing quirks
   triggered (propagated via `app.tasks.dispatch`).
 - **Prometheus metrics** at `GET /metrics`: `sdr_email_dispatch_total`,
   `sdr_llm_tokens_total`, `sdr_llm_calls_total`, `sdr_approval_response_latency_seconds`,
-  `sdr_sender_bounce_rate`, `sdr_queue_depth`.
+  `sdr_sender_bounce_rate`, `sdr_queue_depth`, `sdr_crm_sync_total`,
+  `sdr_suppression_total`, `sdr_variant_sent_total`, `sdr_variant_open_total`,
+  `sdr_variant_reply_total`, `sdr_variant_positive_total`.
+
+## CRM & calendar integration
+
+- Every `positive_interested` reply is pushed to the configured CRM
+  (`CRM_PROVIDER=hubspot` + `HUBSPOT_ACCESS_TOKEN`) as a contact via
+  `app.services.crm.sync_lead_to_crm`, recording `Lead.crm_contact_id` /
+  `crm_synced_at`. A HubSpot 409 (contact already exists) is treated as
+  success and reuses the existing contact ID. A CRM outage is logged and
+  counted (`sdr_crm_sync_total{status="failed"}`) but never blocks triage or
+  the approval gate - CRM sync is additive record-keeping, not on the
+  send-a-reply critical path.
+- If a reply asks to schedule a call, `LLMClient.detect_meeting_intent`
+  flags it and the agentic drafting loop is handed `CALENDAR_BOOKING_URL`
+  (a Cal.com event link or Google Calendar appointment schedule link) to
+  include in its draft - the booking flow itself (availability, timezones,
+  confirmation) is handled entirely by Cal.com/Google Calendar, not by this
+  service.
+- To add another CRM, implement `app.services.crm.CRMProvider` and register
+  it in `get_crm_provider()`.
+
+## Compliance: global suppression list (CAN-SPAM / GDPR)
+
+- `SuppressionEntry` (email + domain, unique) is the global do-not-contact
+  list. **Every** outbound send path - `enrich_lead_task`, `send_email_task`,
+  `follow_up_sequence_task`, and `send_approved_reply_task` - checks
+  `app.services.suppression.is_suppressed` before doing anything, and
+  suppression matches on **domain**, not just the exact address, so once one
+  address at a domain hard-opts-out, nothing at that domain can be targeted
+  again by accident (a stale queued task, a re-uploaded CSV, a new campaign).
+- A `negative_opt_out` sentiment classification suppresses automatically.
+  So does clicking the unsubscribe link that's appended as a footer to every
+  cold email and follow-up (`GET /unsubscribe/{lead_id}?token=...` - a
+  public, single-use-token-protected link, not admin-gated, so recipients
+  can always opt out without authenticating).
+- Admins can also manage the list directly: `GET/POST /suppression`,
+  `DELETE /suppression/{id}`.
+
+## Campaign A/B testing
+
+- `POST /campaigns` creates a campaign with 2+ variants, each with an
+  optional `prompt_hint` (e.g. "punchy question hook" vs. "direct value
+  statement") that's injected into the cold-email generation prompt so
+  variants are actually distinguishable, not converging on the same copy.
+- Enroll leads by passing `campaign_id` to `POST /leads/upload` (JSON body)
+  or `POST /leads/upload/file?campaign_id=...` (CSV/JSON file). Each lead is
+  deterministically assigned one variant (hash of lead ID, weighted by
+  `CampaignVariant.weight`) at first enrichment and keeps it for its whole
+  lifecycle, including follow-ups, so metrics stay statistically clean.
+- Every send, open, reply, and positive-sentiment event increments that
+  lead's variant counters (`sent_count`/`open_count`/`reply_count`/
+  `positive_count`) *and* the matching Prometheus counters
+  (`sdr_variant_sent_total`, `sdr_variant_open_total`,
+  `sdr_variant_reply_total`, `sdr_variant_positive_total`, both labeled
+  `campaign`+`variant`). `GET /campaigns/{id}/stats` returns computed
+  open/reply/positive rates per variant from the same source-of-truth counters.
 
 ## Security
 
 - Admin/dashboard routes (`/dashboard`, `/approvals` list/get,
-  `/leads/enrich/batch`, `/inbound/poll`, `/tracking/bounce`) require either
-  an `X-API-Key` header or a JWT bearer token (`POST /auth/token` with
-  `ADMIN_USERNAME`/`ADMIN_PASSWORD`).
+  `/leads/enrich/batch`, `/inbound/poll`, `/tracking/bounce`, `/suppression`,
+  `/campaigns`) require either an `X-API-Key` header or a JWT bearer token
+  (`POST /auth/token` with `ADMIN_USERNAME`/`ADMIN_PASSWORD`).
 - The approval **decision** endpoints (`/approvals/{id}/decision|approve|reject`)
-  are deliberately *not* behind admin auth - they're the one-click links sent
-  to Telegram/Discord/the dashboard, authenticated instead by the
-  single-use, per-request `approval_token`.
-- Rate limiting (slowapi) on enrichment, sending, webhooks, and approval
-  decisions.
+  and `GET /unsubscribe/{lead_id}` are deliberately *not* behind admin auth -
+  they're one-click links sent to a human outside this system (Telegram/
+  Discord/email), authenticated instead by their own single-use,
+  per-request token (`ApprovalRequest.approval_token` / `Lead.unsubscribe_token`).
+- Rate limiting (slowapi) on enrichment, sending, webhooks, approval
+  decisions, and unsubscribe requests.
 - If `ADMIN_API_KEY`/`ADMIN_USERNAME`+`ADMIN_PASSWORD` aren't set, admin
   routes are left open for local development - the app logs a loud warning
   at startup so this can't silently ship unauthenticated.
@@ -247,6 +319,35 @@ curl -X POST http://localhost:8000/leads/upload \
   -d '{"leads":[{"company_name":"Acme Corp","contact_name":"Jane Doe","email":"jane@acme.com"}]}'
 ```
 
+## Example: A/B testing a campaign
+
+```bash
+curl -X POST http://localhost:8000/campaigns \
+  -H "X-API-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"name":"spring-outreach","variants":[
+        {"label":"A","prompt_hint":"open with a punchy question hook","weight":1},
+        {"label":"B","prompt_hint":"lead with a direct value statement","weight":1}
+      ]}'
+# -> {"id": "<campaign_id>", ...}
+
+curl -X POST http://localhost:8000/leads/upload \
+  -H "Content-Type: application/json" \
+  -d '{"campaign_id":"<campaign_id>","leads":[{"company_name":"Acme Corp","contact_name":"Jane Doe","email":"jane@acme.com"}]}'
+
+curl http://localhost:8000/campaigns/<campaign_id>/stats -H "X-API-Key: $ADMIN_API_KEY"
+```
+
+## Example: managing the suppression list
+
+```bash
+# Manually block an address (e.g. a compliance/legal request)
+curl -X POST http://localhost:8000/suppression \
+  -H "X-API-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"email":"do-not-contact@example.com","reason":"legal request"}'
+
+curl http://localhost:8000/suppression -H "X-API-Key: $ADMIN_API_KEY"
+```
+
 ## Testing
 
 ```bash
@@ -258,10 +359,13 @@ The suite runs against SQLite (both the async and sync engines point at the
 same file, so router-created data is visible to service-layer code under
 test) - no Postgres/Redis needed. Covers: LLM structured-output
 self-correction and give-up-after-N-attempts behavior, the agentic
-draft/critique/revise loop, IMAP body/header parsing edge cases (multipart,
-attachments, RFC 2047 encoded headers, non-UTF8 charsets), approval-gate
-race conditions (concurrent approve/reject, wrong token, double-resolve),
-circuit breaker state transitions, and sender-account bounce-rate auto-pause.
+draft/critique/revise loop and meeting-intent detection, IMAP body/header
+parsing edge cases (multipart, attachments, RFC 2047 encoded headers,
+non-UTF8 charsets), approval-gate race conditions (concurrent approve/reject,
+wrong token, double-resolve), circuit breaker state transitions,
+sender-account bounce-rate auto-pause, suppression-list enforcement across
+every send path, CRM sync success/failure/no-op handling, and A/B variant
+assignment determinism + metric tracking.
 
 ## Error handling notes
 

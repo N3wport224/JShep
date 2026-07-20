@@ -43,6 +43,31 @@ sender_bounce_rate = Histogram(
     buckets=(0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0),
 )
 
+suppression_total = Counter(
+    "sdr_suppression_total",
+    "Entries added to the global suppression/do-not-contact list",
+    ["source"],  # opt_out_reply|unsubscribe_link|bounce|manual
+)
+
+crm_sync_total = Counter(
+    "sdr_crm_sync_total",
+    "CRM contact push attempts",
+    ["provider", "status"],  # status: success|failed
+)
+
+variant_sent_total = Counter(
+    "sdr_variant_sent_total", "Emails sent per A/B campaign variant", ["campaign", "variant"]
+)
+variant_open_total = Counter(
+    "sdr_variant_open_total", "Opens per A/B campaign variant", ["campaign", "variant"]
+)
+variant_reply_total = Counter(
+    "sdr_variant_reply_total", "Replies per A/B campaign variant", ["campaign", "variant"]
+)
+variant_positive_total = Counter(
+    "sdr_variant_positive_total", "Positive-sentiment replies per A/B campaign variant", ["campaign", "variant"]
+)
+
 
 def record_llm_tokens(provider: str, input_tokens: int, output_tokens: int) -> None:
     llm_tokens_total.labels(provider=provider, kind="input").inc(max(input_tokens, 0))

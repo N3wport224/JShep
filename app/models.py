@@ -48,6 +48,20 @@ class Lead(Base):
     next_follow_up_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    # CAN-SPAM/GDPR: every lead gets a stable, unguessable one-click
+    # unsubscribe token at creation time (see routers.suppression).
+    unsubscribe_token: Mapped[str] = mapped_column(String, default=_uuid, unique=True)
+
+    # CRM sync (see app.services.crm) - set once a positive-sentiment lead
+    # has been pushed to the configured CRM.
+    crm_contact_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    crm_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # A/B campaign assignment (see app.services.campaigns) - a lead is
+    # assigned one variant for its whole lifecycle so metrics stay clean.
+    campaign_id: Mapped[str | None] = mapped_column(ForeignKey("campaigns.id"), nullable=True)
+    variant_id: Mapped[str | None] = mapped_column(ForeignKey("campaign_variants.id"), nullable=True)
+
     messages: Mapped[list["EmailMessage"]] = relationship(
         back_populates="lead", cascade="all, delete-orphan", lazy="selectin"
     )
@@ -57,6 +71,8 @@ class Lead(Base):
     thread_messages: Mapped[list["ThreadMessage"]] = relationship(
         back_populates="lead", cascade="all, delete-orphan", lazy="selectin", order_by="ThreadMessage.created_at"
     )
+    campaign: Mapped["Campaign | None"] = relationship(lazy="selectin")
+    variant: Mapped["CampaignVariant | None"] = relationship(lazy="selectin")
 
 
 class MessageDirection(str, enum.Enum):
@@ -226,3 +242,83 @@ class SenderAccount(Base):
         if self.sent_count == 0:
             return 0.0
         return self.bounce_count / self.sent_count
+
+
+class SuppressionSource(str, enum.Enum):
+    OPT_OUT_REPLY = "opt_out_reply"
+    UNSUBSCRIBE_LINK = "unsubscribe_link"
+    BOUNCE = "bounce"
+    MANUAL = "manual"
+
+
+class SuppressionEntry(Base):
+    """
+    Global do-not-contact list (CAN-SPAM/GDPR compliance). Checked before
+    every outbound send (cold email, follow-up, or approved reply) - see
+    app.services.suppression.is_suppressed. An entry suppresses both the
+    exact email AND its domain, so once a hard opt-out/bounce is recorded,
+    no lead at that domain can ever be targeted again by accident.
+    """
+
+    __tablename__ = "suppression_entries"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    email: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    domain: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    source: Mapped[SuppressionSource] = mapped_column(Enum(SuppressionSource), default=SuppressionSource.MANUAL)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Campaign(Base):
+    """An outbound campaign that can run multiple A/B email variants across
+    its assigned leads. See app.services.campaigns for variant assignment
+    and app.core.metrics for the Prometheus counters kept in sync with the
+    per-variant columns below."""
+
+    __tablename__ = "campaigns"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    description: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    variants: Mapped[list["CampaignVariant"]] = relationship(
+        back_populates="campaign", cascade="all, delete-orphan", lazy="selectin", order_by="CampaignVariant.label"
+    )
+
+
+class CampaignVariant(Base):
+    """One A/B variant (e.g. "A" / "B") within a Campaign. `prompt_hint` is
+    injected into the cold-email generation prompt so each variant gets a
+    distinct hook/angle/subject-line style. Counters here are the source of
+    truth for per-variant performance; app.core.metrics mirrors them as
+    Prometheus counters for dashboards/alerting."""
+
+    __tablename__ = "campaign_variants"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id"), nullable=False)
+    label: Mapped[str] = mapped_column(String, nullable=False)
+    prompt_hint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    weight: Mapped[int] = mapped_column(Integer, default=1)
+
+    sent_count: Mapped[int] = mapped_column(Integer, default=0)
+    open_count: Mapped[int] = mapped_column(Integer, default=0)
+    reply_count: Mapped[int] = mapped_column(Integer, default=0)
+    positive_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    campaign: Mapped["Campaign"] = relationship(back_populates="variants", lazy="selectin")
+
+    @property
+    def open_rate(self) -> float:
+        return self.open_count / self.sent_count if self.sent_count else 0.0
+
+    @property
+    def reply_rate(self) -> float:
+        return self.reply_count / self.sent_count if self.sent_count else 0.0
+
+    @property
+    def positive_rate(self) -> float:
+        return self.positive_count / self.sent_count if self.sent_count else 0.0
