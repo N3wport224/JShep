@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>SDR Approval Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; }
+    .pending { background: #fff3cd; }
+    .approved, .sent { background: #d4edda; }
+    .rejected { background: #f8d7da; }
+    a.button { display: inline-block; margin-top: 0.5rem; padding: 6px 14px; border-radius: 4px; text-decoration: none; }
+    .approve { background: #198754; color: white; }
+    .reject { background: #dc3545; color: white; }
+    pre { white-space: pre-wrap; background: #f7f7f7; padding: 0.5rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Pending Approvals ({{ approvals|length }})</h1>
+  {% if not approvals %}
+  <p>No approvals waiting.</p>
+  {% endif %}
+  {% for a in approvals %}
+  <div class="card">
+    <div><span class="badge {{ a.status.value }}">{{ a.status.value }}</span></div>
+    <p><strong>{{ a.lead.contact_name }}</strong> — {{ a.lead.company_name }} ({{ a.lead.email }})</p>
+    <p><em>Their reply:</em></p>
+    <pre>{{ a.reply.raw_body }}</pre>
+    <p><em>AI drafted response:</em></p>
+    <pre>{{ a.drafted_response }}</pre>
+    {% if a.status.value == "pending" %}
+    <a class="button approve" href="/approvals/{{ a.id }}/decision?token={{ a.approval_token }}&action=approve">Approve &amp; Send</a>
+    <a class="button reject" href="/approvals/{{ a.id }}/decision?token={{ a.approval_token }}&action=reject">Reject / Take Over</a>
+    {% endif %}
+  </div>
+  {% endfor %}
+</body>
+</html>
