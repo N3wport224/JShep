@@ -87,6 +87,11 @@ class MessageStatus(str, enum.Enum):
     OPENED = "opened"
     BOUNCED = "bounced"
     FAILED = "failed"
+    # Held by the pre-send spam guardian (app.services.spam_guardian) - still
+    # scored HIGH risk after LLM self-correction rewrite attempts. Excluded
+    # from automatic sending (POST /outbound/send/{id} only queues DRAFT
+    # messages); a human must review and approve it back to DRAFT first.
+    NEEDS_REVIEW = "needs_review"
 
 
 class EmailMessage(Base):
@@ -105,6 +110,15 @@ class EmailMessage(Base):
     in_reply_to_header: Mapped[str | None] = mapped_column(String, nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Pre-send spam guardian result (app.services.spam_guardian.score_email),
+    # recorded on every outbound message regardless of outcome for audit/
+    # dashboard visibility - spam_flagged is only True if the score was
+    # still HIGH risk after self-correction rewrite attempts.
+    spam_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    spam_flagged: Mapped[bool] = mapped_column(Boolean, default=False)
+    spam_reasons: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     lead: Mapped["Lead"] = relationship(back_populates="messages", lazy="selectin")

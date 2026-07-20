@@ -70,6 +70,14 @@ async def gather_funnel_stats(db: AsyncSession) -> dict:
             )
         )
     ).scalar_one()
+    messages_needs_review = (
+        await db.execute(
+            select(func.count()).select_from(EmailMessage).where(
+                EmailMessage.direction == MessageDirection.OUTBOUND,
+                EmailMessage.status == MessageStatus.NEEDS_REVIEW,
+            )
+        )
+    ).scalar_one()
 
     replies_received = (await db.execute(select(func.count()).select_from(Reply))).scalar_one()
 
@@ -94,6 +102,7 @@ async def gather_funnel_stats(db: AsyncSession) -> dict:
         "messages_sent": messages_sent,
         "messages_opened": messages_opened,
         "messages_bounced": messages_bounced,
+        "messages_needs_review": messages_needs_review,
         "replies_received": replies_received,
         "open_rate": _safe_rate(messages_opened, messages_sent),
         "reply_rate": _safe_rate(replies_received, messages_sent),
@@ -121,6 +130,18 @@ async def dashboard_home(request: Request, db: AsyncSession = Depends(get_db)):
         .scalars()
         .all()
     )
+    flagged_messages = (
+        (
+            await db.execute(
+                select(EmailMessage)
+                .where(EmailMessage.status == MessageStatus.NEEDS_REVIEW)
+                .order_by(EmailMessage.created_at.desc())
+                .limit(50)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     return templates.TemplateResponse(
         "dashboard_home.html",
@@ -130,6 +151,7 @@ async def dashboard_home(request: Request, db: AsyncSession = Depends(get_db)):
             "senders": senders,
             "campaigns": campaigns,
             "approvals": pending_approvals,
+            "flagged_messages": flagged_messages,
         },
     )
 

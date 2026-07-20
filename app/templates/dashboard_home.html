@@ -52,8 +52,31 @@
     <div class="stat-card"><div class="value">{{ "%.1f"|format(stats.open_rate * 100) }}%</div><div class="label">Open Rate</div></div>
     <div class="stat-card"><div class="value">{{ "%.1f"|format(stats.reply_rate * 100) }}%</div><div class="label">Reply Rate</div></div>
     <div class="stat-card"><div class="value">{{ "%.2f"|format(stats.bounce_rate * 100) }}%</div><div class="label">Bounce Rate</div></div>
+    <div class="stat-card"><div class="value">{{ stats.messages_needs_review }}</div><div class="label">Spam-Flagged (needs review)</div></div>
     <div class="stat-card"><div class="value">{{ stats.touchpoints_by_status.get("executed", 0) }}</div><div class="label">LinkedIn Touchpoints</div></div>
   </div>
+
+  <h2>Spam Guardian Review Queue ({{ flagged_messages|length }})</h2>
+  <p class="subtitle">Every cold email/follow-up is heuristically scored (trigger words, ALL CAPS, excessive
+    punctuation, link density) before it can enter the sending queue. A draft still scoring HIGH risk after
+    LLM self-correction rewrite attempts is held here instead of sending automatically.</p>
+  {% if not flagged_messages %}
+  <p class="muted">Nothing held for review right now.</p>
+  {% endif %}
+  {% for m in flagged_messages %}
+  <div class="card">
+    <div><span class="badge paused">needs_review &middot; score {{ m.spam_score }}</span></div>
+    <p><strong>{{ m.lead.contact_name }}</strong> &mdash; {{ m.lead.company_name }} ({{ m.lead.email }})</p>
+    <p class="muted">Subject:</p>
+    <pre>{{ m.subject }}</pre>
+    <p class="muted">Body:</p>
+    <pre>{{ m.body }}</pre>
+    <p class="muted">Flagged for: {{ m.spam_reasons }}</p>
+    <p class="muted" style="font-size:0.8rem">Clear for sending via
+      POST /outbound/messages/{{ m.id }}/approve-review (X-API-Key or bearer token; optionally pass edited
+      subject/body in the request body), then POST /outbound/send/{{ m.id }}.</p>
+  </div>
+  {% endfor %}
 
   <h2>Sender Health Guardian</h2>
   {% if not senders %}

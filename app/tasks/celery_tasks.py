@@ -23,6 +23,7 @@ from app.models import (
     SenderAccount,
     TouchpointStatus,
 )
+from app.schemas import SpamRiskLevel
 from app.services.campaigns import assign_variant, record_sent
 from app.services.email_sender import EmailSendError
 from app.services.imap_listener import IMAPListenerError, fetch_new_replies
@@ -32,6 +33,7 @@ from app.services.memory import record_outbound
 from app.services.sender_rotation import NoHealthySenderError, send_via_rotation
 from app.services.sentiment import triage_reply
 from app.services.sequencing import get_sequence_steps, is_linkedin_channel, next_step
+from app.services.spam_guardian import run_with_guard
 from app.services.suppression import is_suppressed, unsubscribe_footer
 from app.tasks.dispatch import with_request_context
 
@@ -59,35 +61,58 @@ def enrich_lead_task(self, lead_id: str) -> dict:
             return {"lead_id": lead_id, "status": "suppressed"}
 
         variant = assign_variant(db, lead)
+        lead_dict = {
+            "company_name": lead.company_name,
+            "contact_name": lead.contact_name,
+            "website": lead.website,
+            "linkedin_url": lead.linkedin_url,
+        }
 
         llm = get_llm_client()
         try:
-            generated = llm.generate_cold_email(
-                {
-                    "company_name": lead.company_name,
-                    "contact_name": lead.contact_name,
-                    "website": lead.website,
-                    "linkedin_url": lead.linkedin_url,
-                },
-                variant_hint=variant.prompt_hint if variant else None,
+            generated, spam_result = run_with_guard(
+                lambda feedback: llm.generate_cold_email(
+                    lead_dict, variant_hint=variant.prompt_hint if variant else None, spam_feedback=feedback
+                )
             )
         except LLMJSONError as exc:
             logger.error("enrich_lead_task: LLM failed", lead_id=lead_id, error=str(exc))
             raise self.retry(exc=exc)
 
+        flagged = spam_result.risk_level == SpamRiskLevel.HIGH
         message = EmailMessage(
             lead_id=lead.id,
             direction=MessageDirection.OUTBOUND,
             sequence_step=0,
             subject=generated.subject,
             body=generated.body + unsubscribe_footer(lead),
-            status=MessageStatus.DRAFT,
+            status=MessageStatus.NEEDS_REVIEW if flagged else MessageStatus.DRAFT,
+            spam_score=spam_result.score,
+            spam_flagged=flagged,
+            spam_reasons="; ".join(spam_result.reasons) or None,
         )
         db.add(message)
         lead.status = LeadStatus.ENRICHED
         db.commit()
-        logger.info("lead_enriched", lead_id=lead_id, message_id=message.id, variant=variant.label if variant else None)
-        return {"lead_id": lead_id, "message_id": message.id, "status": "enriched"}
+        if flagged:
+            logger.warning(
+                "lead_enriched_flagged_for_review",
+                lead_id=lead_id,
+                message_id=message.id,
+                spam_score=spam_result.score,
+                reasons=spam_result.reasons,
+            )
+        else:
+            logger.info(
+                "lead_enriched", lead_id=lead_id, message_id=message.id, variant=variant.label if variant else None,
+                spam_score=spam_result.score,
+            )
+        return {
+            "lead_id": lead_id,
+            "message_id": message.id,
+            "status": "needs_review" if flagged else "enriched",
+            "spam_score": spam_result.score,
+        }
     finally:
         db.close()
 
@@ -212,29 +237,46 @@ def triage_reply_task(self, reply_id: str) -> dict:
 
 
 def _send_email_step(db, lead: Lead, llm, step_number: int, subject_body_context: str) -> bool:
-    """Generate and queue an email follow-up step. Returns True if queued."""
+    """Generate a follow-up step, run it through the pre-send spam guardian,
+    and queue it for sending unless still flagged HIGH risk after
+    self-correction rewrite attempts (in which case it's held as
+    NEEDS_REVIEW - the sequence still advances past this step so one
+    flagged follow-up doesn't stall the rest of the campaign). Returns True
+    if a message was created (queued for sending or held for review)."""
     try:
-        generated = llm.generate_follow_up_email(
-            {"company_name": lead.company_name, "contact_name": lead.contact_name},
-            step_number,
-            subject_body_context,
+        generated, spam_result = run_with_guard(
+            lambda feedback: llm.generate_follow_up_email(
+                {"company_name": lead.company_name, "contact_name": lead.contact_name},
+                step_number,
+                subject_body_context,
+                spam_feedback=feedback,
+            )
         )
     except LLMJSONError as exc:
         logger.error("follow_up_sequence_task: LLM failed", lead_id=lead.id, error=str(exc))
         return False
 
+    flagged = spam_result.risk_level == SpamRiskLevel.HIGH
     message = EmailMessage(
         lead_id=lead.id,
         direction=MessageDirection.OUTBOUND,
         sequence_step=step_number,
         subject=generated.subject,
         body=generated.body + unsubscribe_footer(lead),
-        status=MessageStatus.DRAFT,
+        status=MessageStatus.NEEDS_REVIEW if flagged else MessageStatus.DRAFT,
+        spam_score=spam_result.score,
+        spam_flagged=flagged,
+        spam_reasons="; ".join(spam_result.reasons) or None,
     )
     db.add(message)
     db.flush()
     db.commit()
-    send_email_task.delay(message.id)
+    if flagged:
+        logger.warning(
+            "follow_up_flagged_for_review", lead_id=lead.id, message_id=message.id, spam_score=spam_result.score,
+        )
+    else:
+        send_email_task.delay(message.id)
     return True
 
 

@@ -157,18 +157,25 @@ class LLMClient:
     # Single-shot structured calls
     # ------------------------------------------------------------------
 
-    def generate_cold_email(self, lead: dict, variant_hint: str | None = None) -> ColdEmailDraft:
+    def generate_cold_email(
+        self, lead: dict, variant_hint: str | None = None, spam_feedback: str | None = None
+    ) -> ColdEmailDraft:
         """Generate a personalized cold email for a lead.
         `lead` is a dict with company_name, contact_name, website, linkedin_url.
         `variant_hint` (optional) is an A/B campaign variant's prompt_hint -
         e.g. a requested subject-line style or angle - so each variant
         produces a distinguishable email rather than converging on the same
-        copy every time."""
+        copy every time. `spam_feedback` (optional) is
+        app.services.spam_guardian's flagged reasons from a previous attempt -
+        when set, this is a self-correction rewrite, not a fresh draft."""
         system = (
             "You are an expert SDR copywriter. Write concise, highly personalized "
             "B2B cold outreach emails. Never use generic templates or filler. "
             "Reference specifics about the recipient's company where plausible. "
             "Keep the body under 150 words, no markdown, plain text with line breaks. "
+            "Avoid aggressive sales/spam language (e.g. \"act now\", \"guaranteed\", "
+            "excessive exclamation points, ALL CAPS, or more than one link) - write "
+            "like a real person, not a marketing blast. "
             "Respond with ONLY a JSON object: {\"subject\": string, \"body\": string}."
         )
         user = (
@@ -180,19 +187,36 @@ class LLMClient:
         )
         if variant_hint:
             user += f"\nA/B test variant instruction - follow this angle/style: {variant_hint}\n"
+        if spam_feedback:
+            user += (
+                f"\nYour previous draft was flagged by our pre-send spam heuristic checker "
+                f"for: {spam_feedback}. Rewrite it to sound more natural and conversational, "
+                f"remove any unnecessary links, and tone down urgency/sales language.\n"
+            )
         return self._complete_structured(system, user, ColdEmailDraft, operation="generate_cold_email")
 
-    def generate_follow_up_email(self, lead: dict, step: int, previous_body: str) -> ColdEmailDraft:
+    def generate_follow_up_email(
+        self, lead: dict, step: int, previous_body: str, spam_feedback: str | None = None
+    ) -> ColdEmailDraft:
         system = (
             "You are an expert SDR copywriter writing a brief, friendly follow-up "
             "to a cold email that received no reply. Do not repeat the first email "
             "verbatim; add a new angle or piece of value. Keep it under 80 words. "
+            "Avoid aggressive sales/spam language (e.g. \"act now\", \"guaranteed\", "
+            "excessive exclamation points, ALL CAPS, or more than one link) - write "
+            "like a real person, not a marketing blast. "
             "Respond with ONLY a JSON object: {\"subject\": string, \"body\": string}."
         )
         user = (
             f"This is follow-up #{step} to {lead.get('contact_name')} at {lead.get('company_name')}.\n"
             f"Original email body:\n{previous_body}\n"
         )
+        if spam_feedback:
+            user += (
+                f"\nYour previous draft was flagged by our pre-send spam heuristic checker "
+                f"for: {spam_feedback}. Rewrite it to sound more natural and conversational, "
+                f"remove any unnecessary links, and tone down urgency/sales language.\n"
+            )
         return self._complete_structured(system, user, ColdEmailDraft, operation="generate_follow_up_email")
 
     def classify_sentiment(self, reply_text: str) -> SentimentClassification:

@@ -78,6 +78,7 @@ app/
     warmup.py                                    Inbox warmup stage advancement + daily counter reset
     linkedin_automation.py                         LinkedIn touchpoint payload formatting + execution stub
     sequencing.py                                    Multi-channel (email/LinkedIn) sequence blueprint resolution
+    spam_guardian.py                                   Pre-send spam heuristic scoring + self-correction rewrite loop
   tasks/
     celery_tasks.py            All background task bodies (enrich, send, poll, triage,
                                  follow-up sequence, sender health check, warmup rotation,
@@ -95,11 +96,14 @@ tests/                    pytest suite (LLM self-correction, IMAP parsing quirks
 1. **Ingest** leads via CSV or JSON (`POST /leads/upload`, `/leads/upload/file`).
 2. **Enrich**: `POST /leads/{id}/enrich` (or `/leads/enrich/batch` for many at
    once) queues `enrich_lead_task` - the LLM call happens in a worker, not on
-   the request. Response is `202 {task_id}`.
+   the request. Response is `202 {task_id}`. Every generated draft passes
+   through the **pre-send spam guardian** (`app.services.spam_guardian`)
+   before it's ever eligible to send - see "Pre-send spam guardian" below.
 3. **Send**: `POST /outbound/send/{message_id}` queues `send_email_task`,
    which picks a healthy account via the sender rotation manager, sends, and
    records the message in the lead's conversation memory. Celery beat's
-   `follow-up-sequence` task advances the follow-up sequence automatically.
+   `follow-up-sequence` task advances the follow-up sequence automatically
+   (each follow-up passes through the same spam guardian).
 4. **Replies** arrive via Celery beat's `poll-inbox` task (IMAP) or
    `POST /inbound/webhook` (pushed from an outreach platform). Both enqueue
    `triage_reply_task`.
@@ -216,6 +220,49 @@ tests/                    pytest suite (LLM self-correction, IMAP parsing quirks
   `campaign`+`variant`). `GET /campaigns/{id}/stats` returns computed
   open/reply/positive rates per variant from the same source-of-truth counters.
 
+## Pre-send spam guardian
+
+Every cold email and follow-up is heuristically scored **before it can enter
+the outbound sending queue** - no LLM call, no external API, pure
+deterministic scoring in `app.services.spam_guardian.score_email` (0-100):
+
+- **Trigger words**: a curated list of aggressive sales/spam phrases
+  ("act now", "guaranteed", "risk-free", "no obligation", "buy now", etc.).
+- **Punctuation/formatting**: runs of `!!!`/`???`, an ALL-CAPS subject line,
+  or a body where more than 15% of words are ALL CAPS.
+- **Link density**: more than 2 links, or a link-to-word ratio above 4%.
+- **Aggressive money/urgency phrasing** (`$$$`, "free ... now", etc.).
+
+Score `< SPAM_SCORE_REWRITE_THRESHOLD` (default 40) is **LOW** risk and
+sends normally. `>= SPAM_SCORE_REWRITE_THRESHOLD` but `< SPAM_SCORE_FLAG_THRESHOLD`
+is **MEDIUM** - sent, but the score/reasons are recorded on the message for
+visibility. `>= SPAM_SCORE_FLAG_THRESHOLD` (default 70) is **HIGH** and
+triggers `app.services.spam_guardian.run_with_guard`: the LLM is re-prompted
+with the exact flagged reasons as a rewrite instruction ("sound more
+natural, remove unnecessary links, tone down urgency") up to
+`SPAM_GUARDIAN_MAX_REWRITE_ATTEMPTS` (default 2) times. If it's **still**
+HIGH risk after those attempts, the `EmailMessage` is created as
+`NEEDS_REVIEW` instead of `DRAFT` - and since `POST /outbound/send/{id}`
+only accepts `DRAFT` messages, a flagged draft can never reach the sending
+queue without a human clearing it first:
+
+```bash
+# See what's held for review
+curl http://localhost:8000/outbound/messages?status=needs_review -H "X-API-Key: $ADMIN_API_KEY"
+
+# Clear it (optionally with edited copy) back to DRAFT, then send
+curl -X POST http://localhost:8000/outbound/messages/<message_id>/approve-review \
+  -H "X-API-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"subject":"A calmer subject","body":"A calmer, rewritten body."}'
+curl -X POST http://localhost:8000/outbound/send/<message_id>
+```
+
+The flagged score/reasons are visible on the `/dashboard`'s "Spam Guardian
+Review Queue" section and via `spam_score`/`spam_flagged`/`spam_reasons` on
+`GET /outbound/messages`. Scoring runs on the LLM-generated copy only,
+before the compliance unsubscribe footer is appended, so the mandatory
+footer link never itself trips the link-density check.
+
 ## Sender health guardian (deliverability & warmup)
 
 - **Continuous health tracking**: every `SenderAccount` accumulates
@@ -305,8 +352,9 @@ websockets):
 - Admin/dashboard routes (`/dashboard`, `/approvals` list/get,
   `/leads/enrich/batch`, `/inbound/poll`, `/tracking/bounce`,
   `/tracking/spam-complaint`, `/suppression`, `/campaigns`, `/senders`,
-  `/sequence-steps`) require either an `X-API-Key` header or a JWT bearer
-  token (`POST /auth/token` with `ADMIN_USERNAME`/`ADMIN_PASSWORD`).
+  `/sequence-steps`, `/outbound/messages/{id}/approve-review`) require
+  either an `X-API-Key` header or a JWT bearer token (`POST /auth/token`
+  with `ADMIN_USERNAME`/`ADMIN_PASSWORD`).
 - The approval **decision** endpoints (`/approvals/{id}/decision|approve|reject`)
   and `GET /unsubscribe/{lead_id}` are deliberately *not* behind admin auth -
   they're one-click links sent to a human outside this system (Telegram/
@@ -468,8 +516,11 @@ thresholds, inbox warmup stage advancement and daily counter reset,
 suppression-list enforcement across every send path, CRM sync success/
 failure/no-op handling, A/B variant assignment determinism + metric
 tracking, multi-channel (email/LinkedIn) sequence resolution and the
-LinkedIn automation stub's simulate-vs-webhook behavior, and dashboard
-rendering/auth.
+LinkedIn automation stub's simulate-vs-webhook behavior, dashboard
+rendering/auth, and the pre-send spam guardian (trigger-word/punctuation/
+caps/link-density scoring, the self-correction rewrite loop, and that a
+still-HIGH-risk draft is held as NEEDS_REVIEW and provably cannot reach
+`POST /outbound/send/{id}` without a human clearing it first).
 
 ## Error handling notes
 
@@ -487,6 +538,10 @@ rendering/auth.
 - If every sender account is paused/over its limit/circuit-open, sends fail
   with a clear `NoHealthySenderError` rather than silently sending from an
   unhealthy account.
+- A draft still scoring HIGH spam risk after self-correction rewrite
+  attempts is never silently sent or silently dropped - it's held as
+  `NEEDS_REVIEW` with its score/reasons recorded, visible on `/dashboard`
+  and via `GET /outbound/messages?status=needs_review`.
 
 ## Security notes
 

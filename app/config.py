@@ -80,6 +80,16 @@ class Settings(BaseSettings):
     warmup_enabled: bool = True
     warmup_daily_targets: str = "10,20,40,80,150,200"
 
+    # --- Pre-send spam heuristic guardian (app.services.spam_guardian) ---
+    # Every cold email / follow-up is scored (0-100) before it can enter the
+    # outbound sending queue. >= rewrite threshold triggers LLM
+    # self-correction rewrite attempts; if still >= flag threshold after
+    # those attempts, the message is held as NEEDS_REVIEW instead of being
+    # queued for automatic sending.
+    spam_score_rewrite_threshold: int = 40
+    spam_score_flag_threshold: int = 70
+    spam_guardian_max_rewrite_attempts: int = 2
+
     # --- Inbound email (IMAP) - default account used by the poller ---
     imap_host: Optional[str] = None
     imap_port: int = 993

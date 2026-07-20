@@ -1,4 +1,5 @@
 """Pydantic request/response schemas."""
+import enum
 from datetime import datetime
 from typing import Optional
 
@@ -14,6 +15,26 @@ from app.models import (
     SuppressionSource,
     TouchpointStatus,
 )
+
+
+class SpamRiskLevel(str, enum.Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class SpamScoreResult(BaseModel):
+    """Output of app.services.spam_guardian.score_email - a deterministic
+    heuristic pass, not an LLM call, run on every cold email/follow-up
+    before it can enter the outbound sending queue."""
+
+    score: int = Field(ge=0, le=100)
+    risk_level: SpamRiskLevel
+    trigger_words_found: list[str] = Field(default_factory=list)
+    caps_ratio: float = 0.0
+    link_count: int = 0
+    link_density: float = 0.0
+    reasons: list[str] = Field(default_factory=list)
 
 
 class LeadIn(BaseModel):
@@ -55,10 +76,21 @@ class EmailMessageOut(BaseModel):
     subject: str
     body: str
     status: MessageStatus
+    spam_score: Optional[int]
+    spam_flagged: bool
+    spam_reasons: Optional[str]
     sent_at: Optional[datetime]
     opened_at: Optional[datetime]
 
     model_config = {"from_attributes": True}
+
+
+class ReviewApprovalIn(BaseModel):
+    """Optional edited copy when clearing a NEEDS_REVIEW message back to
+    DRAFT so it can be sent - if omitted, the original AI draft is kept."""
+
+    subject: Optional[str] = None
+    body: Optional[str] = None
 
 
 class ReplyOut(BaseModel):
