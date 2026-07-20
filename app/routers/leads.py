@@ -12,8 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import limiter, require_admin
 from app.database import get_db
-from app.models import Campaign, Lead, LeadStatus
-from app.schemas import LeadIn, LeadOut, LeadUploadPayload
+from app.models import Campaign, Lead, LeadStatus, LinkedInTouchpoint
+from app.schemas import LeadIn, LeadOut, LeadUploadPayload, LinkedInTouchpointOut
 from app.tasks.celery_tasks import batch_enrich_leads_task, enrich_lead_task
 from app.tasks.dispatch import enqueue
 
@@ -111,6 +111,18 @@ async def get_lead(lead_id: str, db: AsyncSession = Depends(get_db)):
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     return lead
+
+
+@router.get("/{lead_id}/linkedin-touchpoints", response_model=list[LinkedInTouchpointOut])
+async def list_linkedin_touchpoints(lead_id: str, db: AsyncSession = Depends(get_db)):
+    if not await db.get(Lead, lead_id):
+        raise HTTPException(status_code=404, detail="Lead not found")
+    result = await db.execute(
+        select(LinkedInTouchpoint)
+        .where(LinkedInTouchpoint.lead_id == lead_id)
+        .order_by(LinkedInTouchpoint.sequence_step)
+    )
+    return result.scalars().all()
 
 
 @router.post("/{lead_id}/enrich", status_code=202)

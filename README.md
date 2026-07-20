@@ -57,6 +57,8 @@ app/
     auth.py                              JWT issuance (POST /auth/token)
     suppression.py                       Suppression list admin API + public unsubscribe
     campaigns.py                         A/B campaign CRUD + per-variant stats
+    senders.py                           Sender health guardian admin API (list/pause/unpause)
+    sequences.py                         Multi-channel sequence blueprint config (email + LinkedIn)
   services/
     llm.py                    Anthropic/OpenAI wrapper: structured output validation
                                 with self-correction retries, agentic reply loop,
@@ -73,14 +75,19 @@ app/
     crm.py                                 CRM contact push (HubSpot)
     calendar.py                              Booking-link lookup for meeting requests
     campaigns.py                               A/B variant assignment + metric tracking
+    warmup.py                                    Inbox warmup stage advancement + daily counter reset
+    linkedin_automation.py                         LinkedIn touchpoint payload formatting + execution stub
+    sequencing.py                                    Multi-channel (email/LinkedIn) sequence blueprint resolution
   tasks/
     celery_tasks.py            All background task bodies (enrich, send, poll, triage,
-                                 follow-up sequence, bounce health check)
+                                 follow-up sequence, sender health check, warmup rotation,
+                                 LinkedIn touchpoint execution)
     dispatch.py                  enqueue() / request-ID propagation into tasks
 alembic/                 Database migrations (source of truth for schema)
 tests/                    pytest suite (LLM self-correction, IMAP parsing quirks,
                             approval race conditions, circuit breaker, bounce auto-pause,
-                            suppression enforcement, CRM sync, A/B assignment/metrics)
+                            suppression enforcement, CRM sync, A/B assignment/metrics,
+                            sender health/warmup, multi-channel sequencing, dashboard rendering)
 ```
 
 ### Request/task flow
@@ -132,7 +139,9 @@ tests/                    pytest suite (LLM self-correction, IMAP parsing quirks
   `bounce_count`; once the bounce rate crosses `BOUNCE_RATE_PAUSE_THRESHOLD`
   (after `BOUNCE_RATE_MIN_SAMPLE` sends), the account is auto-paused and
   excluded from rotation. `POST /tracking/bounce/{message_id}` is the
-  integration point for a provider's bounce/DSN webhook.
+  integration point for a provider's bounce/DSN webhook. See "Sender health
+  guardian" below for the full deliverability picture (spam complaints,
+  warmup).
 
 ## Observability
 
@@ -142,9 +151,15 @@ tests/                    pytest suite (LLM self-correction, IMAP parsing quirks
   triggered (propagated via `app.tasks.dispatch`).
 - **Prometheus metrics** at `GET /metrics`: `sdr_email_dispatch_total`,
   `sdr_llm_tokens_total`, `sdr_llm_calls_total`, `sdr_approval_response_latency_seconds`,
-  `sdr_sender_bounce_rate`, `sdr_queue_depth`, `sdr_crm_sync_total`,
+  `sdr_sender_bounce_rate`, `sdr_sender_spam_complaint_rate`, `sdr_sender_warmup_stage`,
+  `sdr_sender_daily_limit`, `sdr_queue_depth`, `sdr_crm_sync_total`,
   `sdr_suppression_total`, `sdr_variant_sent_total`, `sdr_variant_open_total`,
-  `sdr_variant_reply_total`, `sdr_variant_positive_total`.
+  `sdr_variant_reply_total`, `sdr_variant_positive_total`, `sdr_linkedin_touchpoint_total`.
+- **Real-time funnel dashboard** at `GET /dashboard` (admin-protected,
+  auto-refreshes every 20s): lead funnel counts by status, enrichment/
+  delivery/open/reply/bounce rates computed live from the database, the
+  sender health guardian table, A/B variant comparison, and the pending
+  approval queue with inline Approve/Reject actions - see "Dashboard" below.
 
 ## CRM & calendar integration
 
@@ -201,12 +216,97 @@ tests/                    pytest suite (LLM self-correction, IMAP parsing quirks
   `campaign`+`variant`). `GET /campaigns/{id}/stats` returns computed
   open/reply/positive rates per variant from the same source-of-truth counters.
 
+## Sender health guardian (deliverability & warmup)
+
+- **Continuous health tracking**: every `SenderAccount` accumulates
+  `sent_count`/`bounce_count`/`open_count`/`spam_complaint_count` for a
+  rolling daily window (reset by the warmup rotation task below, not
+  all-time totals). `GET /senders` (admin) surfaces the live snapshot;
+  `sender_health_check_task` runs every 15 minutes and logs any account
+  trending toward 80% of either pause threshold so an operator can look
+  before it trips.
+- **Automated circuit breaker**: an account crossing `BOUNCE_RATE_PAUSE_THRESHOLD`
+  (default **2%**) or `SPAM_COMPLAINT_RATE_PAUSE_THRESHOLD` (default **0.1%**,
+  a far stricter bar since complaints damage reputation faster than
+  bounces) - after at least `BOUNCE_RATE_MIN_SAMPLE` sends, to avoid
+  tripping on one early bounce - is immediately `is_paused=True` and
+  excluded from `send_via_rotation`'s candidate pool. Report a spam
+  complaint from your mailbox provider's feedback-loop webhook via
+  `POST /tracking/spam-complaint/{message_id}`.
+- **No separate "reassignment" step needed**: no `EmailMessage` is pinned to
+  a sender account until the moment it's actually sent, so a mid-campaign
+  pause automatically routes the rest of that campaign's queue to whichever
+  other accounts are still healthy.
+- **Manual override**: `POST /senders/{id}/pause` / `/unpause` (admin) -
+  auto-pause never clears itself; a human should confirm the underlying
+  issue is resolved before resuming sends from that identity.
+- **Inbox warmup**: a brand-new (or freshly re-enabled) sender account
+  starts at the first stage of `WARMUP_DAILY_TARGETS` (default
+  `10,20,40,80,150,200`) instead of blasting at full `daily_limit` from day
+  one. The daily `warmup_rotation_task` advances every non-paused account
+  to the next stage and resets its rolling counters for the new day; set
+  `WARMUP_ENABLED=false` to disable and use `daily_limit` at full volume
+  immediately. This is a simulated/local warmup scheduler - integrating a
+  real seed-account warmup pool provider would extend
+  `app.services.warmup.advance_warmup` to also call that provider's API.
+
+## Multi-channel outreach (email + LinkedIn)
+
+- A sequence step is one of three channels: `email`, `linkedin_view`, or
+  `linkedin_connection`. Configure a blueprint with
+  `PUT /sequence-steps?campaign_id=...` (omit `campaign_id` for the global
+  default sequence used by leads with no campaign-specific blueprint):
+  ```bash
+  curl -X PUT "http://localhost:8000/sequence-steps?campaign_id=<id>" \
+    -H "X-API-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+    -d '[{"step_number":1,"channel":"email","delay_days":0},
+         {"step_number":2,"channel":"linkedin_view","delay_days":2},
+         {"step_number":3,"channel":"linkedin_connection","delay_days":3},
+         {"step_number":4,"channel":"email","delay_days":4}]'
+  ```
+- `follow_up_sequence_task` (Celery beat, every 30 min) is channel-aware: an
+  `email` step generates and sends a follow-up exactly as before; a
+  `linkedin_view`/`linkedin_connection` step creates a `LinkedInTouchpoint`
+  row and queues `execute_linkedin_touchpoint_task`. A lead whose campaign
+  has no custom blueprint (or has no campaign) falls back to the legacy
+  pure-email `FOLLOW_UP_DELAYS_DAYS` sequence unchanged.
+- **LinkedIn execution is a safe stub, never a real browser**:
+  `app.services.linkedin_automation` formats a provider-agnostic payload
+  (`{action, lead_id, linkedin_url, contact_name, company_name}`) and posts
+  it to `LINKEDIN_AUTOMATION_WEBHOOK_URL` - the actual endpoint of a
+  headless-browser automation layer (a PhantomBuster Phantom's launch
+  webhook, a local Playwright worker's job queue, etc.) that you run and
+  control. With no webhook configured, execution is simulated (logged,
+  marked executed) so sequences work end to end in dev/test.
+- `GET /leads/{id}/linkedin-touchpoints` lists a lead's touchpoint history
+  (status, payload, external job reference, any error).
+
+## Dashboard
+
+`GET /dashboard` (admin-protected, pass `?token=<jwt>` or an `X-API-Key`
+header) is a single server-rendered page (Jinja2, no JS framework, `<meta
+http-equiv="refresh">` every 20s for near-real-time updates without
+websockets):
+
+- **Lead funnel**: total leads and a breakdown by every `LeadStatus`.
+- **Delivery & engagement rates**: enrichment rate, emails sent, open rate,
+  reply rate, bounce rate, LinkedIn touchpoints executed - all computed
+  live from the database on each request, never cached/stale.
+- **Sender health guardian table**: every account's status (active/paused +
+  reason), warmup stage, daily limit, and bounce/open/spam-complaint rates.
+- **A/B campaign variant comparison**: per-campaign table of sent/open-rate/
+  reply-rate/positive-rate per variant.
+- **Pending approval queue with inline actions**: the same Approve & Send /
+  Reject buttons as the Telegram/Discord notifications, so an operator can
+  clear the human-in-the-loop queue from one screen.
+
 ## Security
 
 - Admin/dashboard routes (`/dashboard`, `/approvals` list/get,
-  `/leads/enrich/batch`, `/inbound/poll`, `/tracking/bounce`, `/suppression`,
-  `/campaigns`) require either an `X-API-Key` header or a JWT bearer token
-  (`POST /auth/token` with `ADMIN_USERNAME`/`ADMIN_PASSWORD`).
+  `/leads/enrich/batch`, `/inbound/poll`, `/tracking/bounce`,
+  `/tracking/spam-complaint`, `/suppression`, `/campaigns`, `/senders`,
+  `/sequence-steps`) require either an `X-API-Key` header or a JWT bearer
+  token (`POST /auth/token` with `ADMIN_USERNAME`/`ADMIN_PASSWORD`).
 - The approval **decision** endpoints (`/approvals/{id}/decision|approve|reject`)
   and `GET /unsubscribe/{lead_id}` are deliberately *not* behind admin auth -
   they're one-click links sent to a human outside this system (Telegram/
@@ -363,9 +463,13 @@ draft/critique/revise loop and meeting-intent detection, IMAP body/header
 parsing edge cases (multipart, attachments, RFC 2047 encoded headers,
 non-UTF8 charsets), approval-gate race conditions (concurrent approve/reject,
 wrong token, double-resolve), circuit breaker state transitions,
-sender-account bounce-rate auto-pause, suppression-list enforcement across
-every send path, CRM sync success/failure/no-op handling, and A/B variant
-assignment determinism + metric tracking.
+sender-account bounce/spam-complaint-rate auto-pause with the 2%/0.1%
+thresholds, inbox warmup stage advancement and daily counter reset,
+suppression-list enforcement across every send path, CRM sync success/
+failure/no-op handling, A/B variant assignment determinism + metric
+tracking, multi-channel (email/LinkedIn) sequence resolution and the
+LinkedIn automation stub's simulate-vs-webhook behavior, and dashboard
+rendering/auth.
 
 ## Error handling notes
 

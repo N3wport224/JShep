@@ -12,21 +12,26 @@ from app.db_sync import SessionLocalSync
 from app.models import (
     ApprovalRequest,
     ApprovalStatus,
+    ChannelType,
     EmailMessage,
     Lead,
     LeadStatus,
+    LinkedInTouchpoint,
     MessageDirection,
     MessageStatus,
     Reply,
     SenderAccount,
+    TouchpointStatus,
 )
 from app.services.campaigns import assign_variant, record_sent
 from app.services.email_sender import EmailSendError
 from app.services.imap_listener import IMAPListenerError, fetch_new_replies
+from app.services.linkedin_automation import LinkedInAutomationError, build_payload, execute_touchpoint
 from app.services.llm import LLMJSONError, get_llm_client
 from app.services.memory import record_outbound
 from app.services.sender_rotation import NoHealthySenderError, send_via_rotation
 from app.services.sentiment import triage_reply
+from app.services.sequencing import get_sequence_steps, is_linkedin_channel, next_step
 from app.services.suppression import is_suppressed, unsubscribe_footer
 from app.tasks.dispatch import with_request_context
 
@@ -161,7 +166,7 @@ def send_email_task(self, message_id: str) -> dict:
         record_sent(db, lead)
 
         if message.sequence_step == 0:
-            arm_first_follow_up(get_settings(), lead)
+            arm_first_follow_up(get_settings(), lead, db=db)
 
         db.commit()
         logger.info("email_sent", message_id=message_id, lead_id=lead.id, sender_account=account.name)
@@ -206,18 +211,57 @@ def triage_reply_task(self, reply_id: str) -> dict:
         db.close()
 
 
+def _send_email_step(db, lead: Lead, llm, step_number: int, subject_body_context: str) -> bool:
+    """Generate and queue an email follow-up step. Returns True if queued."""
+    try:
+        generated = llm.generate_follow_up_email(
+            {"company_name": lead.company_name, "contact_name": lead.contact_name},
+            step_number,
+            subject_body_context,
+        )
+    except LLMJSONError as exc:
+        logger.error("follow_up_sequence_task: LLM failed", lead_id=lead.id, error=str(exc))
+        return False
+
+    message = EmailMessage(
+        lead_id=lead.id,
+        direction=MessageDirection.OUTBOUND,
+        sequence_step=step_number,
+        subject=generated.subject,
+        body=generated.body + unsubscribe_footer(lead),
+        status=MessageStatus.DRAFT,
+    )
+    db.add(message)
+    db.flush()
+    db.commit()
+    send_email_task.delay(message.id)
+    return True
+
+
+def _queue_linkedin_step(db, lead: Lead, step_number: int, channel: ChannelType) -> None:
+    import json
+
+    touchpoint = LinkedInTouchpoint(
+        lead_id=lead.id,
+        sequence_step=step_number,
+        action=channel,
+        status=TouchpointStatus.QUEUED,
+        payload=json.dumps(build_payload(lead, channel)),
+    )
+    db.add(touchpoint)
+    db.flush()
+    db.commit()
+    execute_linkedin_touchpoint_task.delay(touchpoint.id)
+
+
 @celery_app.task(name="app.tasks.celery_tasks.follow_up_sequence_task")
 @with_request_context
 def follow_up_sequence_task() -> dict:
     from app.config import get_settings
 
     settings = get_settings()
-    delays = _parse_follow_up_delays(settings)
-    if not delays:
-        return {"status": "no_sequence_configured"}
-
     db = SessionLocalSync()
-    sent = 0
+    queued = 0
     try:
         due_leads = (
             db.query(Lead)
@@ -225,7 +269,6 @@ def follow_up_sequence_task() -> dict:
                 Lead.status.in_([LeadStatus.SENT, LeadStatus.OPENED]),
                 Lead.next_follow_up_at.isnot(None),
                 Lead.next_follow_up_at <= datetime.utcnow(),
-                Lead.follow_up_step < len(delays),
             )
             .all()
         )
@@ -234,6 +277,52 @@ def follow_up_sequence_task() -> dict:
             if is_suppressed(db, lead.email):
                 logger.info("follow_up_sequence_task: lead is suppressed, skipping", lead_id=lead.id)
                 lead.status = LeadStatus.OPTED_OUT
+                lead.next_follow_up_at = None
+                db.commit()
+                continue
+
+            steps = get_sequence_steps(db, lead)
+            step_number = lead.follow_up_step + 1
+
+            if steps:
+                # Channel-aware multi-touch sequence (email + LinkedIn steps).
+                config = next_step(steps, lead.follow_up_step)
+                if not config:
+                    lead.next_follow_up_at = None
+                    db.commit()
+                    continue
+
+                if is_linkedin_channel(config.channel):
+                    _queue_linkedin_step(db, lead, config.step_number, config.channel)
+                    queued += 1
+                else:
+                    last_message = (
+                        db.query(EmailMessage)
+                        .filter(
+                            EmailMessage.lead_id == lead.id,
+                            EmailMessage.direction == MessageDirection.OUTBOUND,
+                            EmailMessage.status == MessageStatus.SENT,
+                        )
+                        .order_by(EmailMessage.created_at.desc())
+                        .first()
+                    )
+                    if not last_message:
+                        continue
+                    if not _send_email_step(db, lead, llm, config.step_number, last_message.body):
+                        continue
+                    queued += 1
+
+                lead.follow_up_step = config.step_number
+                upcoming = next_step(steps, config.step_number)
+                lead.next_follow_up_at = (
+                    datetime.utcnow() + timedelta(days=config.delay_days) if upcoming else None
+                )
+                db.commit()
+                continue
+
+            # Legacy pure-email sequence (no SequenceStepConfig configured).
+            delays = _parse_follow_up_delays(settings)
+            if not delays or lead.follow_up_step >= len(delays):
                 lead.next_follow_up_at = None
                 db.commit()
                 continue
@@ -251,41 +340,61 @@ def follow_up_sequence_task() -> dict:
             if not last_message:
                 continue
 
-            step = lead.follow_up_step + 1
-            try:
-                generated = llm.generate_follow_up_email(
-                    {"company_name": lead.company_name, "contact_name": lead.contact_name}, step, last_message.body
-                )
-            except LLMJSONError as exc:
-                logger.error("follow_up_sequence_task: LLM failed", lead_id=lead.id, error=str(exc))
+            if not _send_email_step(db, lead, llm, step_number, last_message.body):
                 continue
 
-            message = EmailMessage(
-                lead_id=lead.id,
-                direction=MessageDirection.OUTBOUND,
-                sequence_step=step,
-                subject=generated.subject,
-                body=generated.body + unsubscribe_footer(lead),
-                status=MessageStatus.DRAFT,
-            )
-            db.add(message)
-            db.flush()
-            db.commit()
-            send_email_task.delay(message.id)
-            lead.follow_up_step = step
+            lead.follow_up_step = step_number
             lead.next_follow_up_at = (
-                datetime.utcnow() + timedelta(days=delays[step]) if step < len(delays) else None
+                datetime.utcnow() + timedelta(days=delays[step_number]) if step_number < len(delays) else None
             )
             db.commit()
-            sent += 1
-        return {"status": "ok", "follow_ups_queued": sent}
+            queued += 1
+        return {"status": "ok", "follow_ups_queued": queued}
     finally:
         db.close()
 
 
-@celery_app.task(name="app.tasks.celery_tasks.bounce_health_check_task")
+@celery_app.task(
+    name="app.tasks.celery_tasks.execute_linkedin_touchpoint_task", bind=True, max_retries=3, default_retry_delay=30
+)
 @with_request_context
-def bounce_health_check_task() -> dict:
+def execute_linkedin_touchpoint_task(self, touchpoint_id: str) -> dict:
+    db = SessionLocalSync()
+    try:
+        touchpoint = db.get(LinkedInTouchpoint, touchpoint_id)
+        if not touchpoint:
+            return {"touchpoint_id": touchpoint_id, "status": "not_found"}
+
+        try:
+            external_reference = execute_touchpoint(touchpoint)
+        except LinkedInAutomationError as exc:
+            logger.error("execute_linkedin_touchpoint_task: failed", touchpoint_id=touchpoint_id, error=str(exc))
+            touchpoint.status = TouchpointStatus.FAILED
+            touchpoint.error = str(exc)
+            db.commit()
+            return {"touchpoint_id": touchpoint_id, "status": "failed", "error": str(exc)}
+        except (ConnectionError, TimeoutError) as exc:
+            logger.warning("execute_linkedin_touchpoint_task: retrying", touchpoint_id=touchpoint_id, error=str(exc))
+            raise self.retry(exc=exc)
+
+        touchpoint.status = TouchpointStatus.EXECUTED
+        touchpoint.external_reference = external_reference
+        touchpoint.executed_at = datetime.utcnow()
+        db.commit()
+        logger.info("linkedin_touchpoint_executed", touchpoint_id=touchpoint_id, action=touchpoint.action.value)
+        return {"touchpoint_id": touchpoint_id, "status": "executed"}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.tasks.celery_tasks.sender_health_check_task")
+@with_request_context
+def sender_health_check_task() -> dict:
+    """Continuous sender-health monitoring: proactively flags accounts
+    trending toward the bounce/spam-complaint auto-pause thresholds (see
+    app.services.sender_rotation._maybe_auto_pause, which does the actual
+    pausing reactively on every bounce/complaint event) so an operator can
+    intervene before an account gets isolated mid-campaign."""
     from app.config import get_settings
 
     settings = get_settings()
@@ -294,15 +403,39 @@ def bounce_health_check_task() -> dict:
         accounts = db.query(SenderAccount).all()
         at_risk = []
         for account in accounts:
-            if account.is_paused:
+            if account.is_paused or account.sent_count < settings.bounce_rate_min_sample:
                 continue
-            if account.sent_count >= settings.bounce_rate_min_sample and account.bounce_rate >= (
-                settings.bounce_rate_pause_threshold * 0.8
-            ):
-                at_risk.append({"account": account.name, "bounce_rate": round(account.bounce_rate, 4)})
+            if account.bounce_rate >= settings.bounce_rate_pause_threshold * 0.8:
+                at_risk.append(
+                    {"account": account.name, "signal": "bounce_rate", "rate": round(account.bounce_rate, 4)}
+                )
+            elif account.spam_complaint_rate >= settings.spam_complaint_rate_pause_threshold * 0.8:
+                at_risk.append(
+                    {
+                        "account": account.name,
+                        "signal": "spam_complaint_rate",
+                        "rate": round(account.spam_complaint_rate, 4),
+                    }
+                )
         if at_risk:
             logger.warning("sender_accounts_at_risk", accounts=at_risk)
         return {"checked": len(accounts), "at_risk": at_risk}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.tasks.celery_tasks.warmup_rotation_task")
+@with_request_context
+def warmup_rotation_task() -> dict:
+    """Daily: advance each sender account's inbox-warmup stage and reset
+    its rolling daily send/bounce/open/spam-complaint counters. See
+    app.services.warmup.advance_warmup."""
+    from app.config import get_settings
+    from app.services.warmup import advance_warmup
+
+    db = SessionLocalSync()
+    try:
+        return advance_warmup(db, get_settings())
     finally:
         db.close()
 

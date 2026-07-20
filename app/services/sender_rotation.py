@@ -1,10 +1,17 @@
 """
-Multi-provider outbound sender pool. Abstracts over raw SMTP accounts and
-API-based outreach platforms (Instantly, Smartlead) behind one interface, and
-picks a healthy, non-paused account for each send using least-recently-used
-rotation. Bounce tracking here auto-pauses an account once its bounce rate
-crosses BOUNCE_RATE_PAUSE_THRESHOLD, protecting domain reputation instead of
-letting a failing account keep sending.
+Multi-provider outbound sender pool ("sender health guardian"). Abstracts
+over raw SMTP accounts and API-based outreach platforms (Instantly,
+Smartlead) behind one interface, and picks a healthy, non-paused account for
+each send using least-recently-used rotation.
+
+Health tracking here auto-pauses an account once its bounce rate crosses
+BOUNCE_RATE_PAUSE_THRESHOLD (default 2%) or its spam-complaint rate crosses
+SPAM_COMPLAINT_RATE_PAUSE_THRESHOLD (default 0.1%), protecting domain
+reputation instead of letting a failing account keep sending. Because no
+EmailMessage is pinned to a sender account until the moment it's actually
+sent (see send_via_rotation), a mid-campaign pause automatically routes the
+rest of that campaign's remaining queue to whichever other accounts are
+still healthy - there's no separate "reassignment" step needed.
 """
 import abc
 import logging
@@ -14,7 +21,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.core.metrics import email_dispatch_total, sender_bounce_rate
+from app.core.metrics import email_dispatch_total, sender_bounce_rate, sender_spam_complaint_rate
 from app.core.resilience import RateLimitedError, get_circuit_breaker, resilient_retry
 from app.models import SenderAccount, SenderProvider
 from app.services.email_sender import EmailSendError, send_email_smtp
@@ -201,29 +208,104 @@ def send_via_rotation(
     return message_id, account
 
 
-def record_bounce(db: Session, account: SenderAccount) -> None:
-    """Called when a send/DSN indicates a bounce for messages routed through
-    this account. Auto-pauses the account once its bounce rate crosses the
-    configured threshold (with a minimum sample size to avoid pausing on a
-    single unlucky early bounce)."""
-    settings = get_settings()
-    account.bounce_count += 1
-    sender_bounce_rate.labels(sender_account=account.name).observe(account.bounce_rate)
+def _maybe_auto_pause(account: SenderAccount, settings) -> None:
+    """Shared circuit-breaker check for both bounce and spam-complaint
+    tracking: pause the account the moment either rate crosses its
+    threshold, with a minimum sample size so one early bounce/complaint on
+    a brand-new account doesn't trip it."""
+    if account.is_paused or account.sent_count < settings.bounce_rate_min_sample:
+        return
 
-    if (
-        not account.is_paused
-        and account.sent_count >= settings.bounce_rate_min_sample
-        and account.bounce_rate >= settings.bounce_rate_pause_threshold
-    ):
+    if account.bounce_rate >= settings.bounce_rate_pause_threshold:
         account.is_paused = True
         account.pause_reason = (
             f"Auto-paused: bounce rate {account.bounce_rate:.1%} exceeded "
             f"threshold {settings.bounce_rate_pause_threshold:.1%} "
             f"({account.bounce_count}/{account.sent_count} sent)"
         )
+    elif account.spam_complaint_rate >= settings.spam_complaint_rate_pause_threshold:
+        account.is_paused = True
+        account.pause_reason = (
+            f"Auto-paused: spam complaint rate {account.spam_complaint_rate:.2%} exceeded "
+            f"threshold {settings.spam_complaint_rate_pause_threshold:.2%} "
+            f"({account.spam_complaint_count}/{account.sent_count} sent)"
+        )
+
+    if account.is_paused:
         logger.warning("Sender account %s auto-paused: %s", account.name, account.pause_reason)
 
+
+def record_bounce(db: Session, account: SenderAccount) -> None:
+    """Called when a send/DSN indicates a bounce for messages routed through
+    this account. Auto-pauses the account once its bounce rate crosses the
+    configured threshold (default 2%, see BOUNCE_RATE_PAUSE_THRESHOLD)."""
+    settings = get_settings()
+    account.bounce_count += 1
+    sender_bounce_rate.labels(sender_account=account.name).observe(account.bounce_rate)
+    _maybe_auto_pause(account, settings)
     db.commit()
+
+
+def record_spam_complaint(db: Session, account: SenderAccount) -> None:
+    """Called when a mailbox provider (via feedback loop / provider webhook)
+    reports a spam complaint for a message routed through this account.
+    Auto-pauses once the complaint rate crosses SPAM_COMPLAINT_RATE_PAUSE_THRESHOLD
+    (default 0.1%) - a much stricter bar than bounce rate, since spam
+    complaints damage sender reputation far more per-incident."""
+    settings = get_settings()
+    account.spam_complaint_count += 1
+    sender_spam_complaint_rate.labels(sender_account=account.name).observe(account.spam_complaint_rate)
+    _maybe_auto_pause(account, settings)
+    db.commit()
+
+
+def record_open(db: Session, account: SenderAccount) -> None:
+    """Called from the tracking-pixel endpoint for messages with a known
+    sender account, so per-account open rate is part of the health picture
+    alongside bounce/spam-complaint rate."""
+    account.open_count += 1
+    db.commit()
+
+
+def get_sender_health_snapshot(db: Session) -> list[dict]:
+    """One row per sender account with everything the dashboard/senders API
+    needs: volume, rates, pause state, warmup progress."""
+    accounts = db.query(SenderAccount).order_by(SenderAccount.name).all()
+    return [
+        {
+            "id": a.id,
+            "name": a.name,
+            "provider": a.provider.value,
+            "is_paused": a.is_paused,
+            "pause_reason": a.pause_reason,
+            "daily_limit": a.daily_limit,
+            "sent_count": a.sent_count,
+            "bounce_count": a.bounce_count,
+            "open_count": a.open_count,
+            "spam_complaint_count": a.spam_complaint_count,
+            "bounce_rate": a.bounce_rate,
+            "open_rate": a.open_rate,
+            "spam_complaint_rate": a.spam_complaint_rate,
+            "warmup_stage": a.warmup_stage,
+            "warmup_complete": a.warmup_complete,
+        }
+        for a in accounts
+    ]
+
+
+def _initial_daily_limit(settings, explicit: int | None) -> int:
+    """New sender accounts start at the first inbox-warmup stage's target
+    (not the full daily_limit) when warmup is enabled, unless the caller
+    explicitly overrode daily_limit."""
+    if explicit is not None:
+        return explicit
+    if settings.warmup_enabled:
+        from app.services.warmup import warmup_targets
+
+        targets = warmup_targets(settings)
+        if targets:
+            return targets[0]
+    return 200
 
 
 def seed_sender_accounts_from_env(db: Session) -> None:
@@ -249,6 +331,7 @@ def seed_sender_accounts_from_env(db: Session) -> None:
                 smtp_username=settings.smtp_username,
                 smtp_password=settings.smtp_password,
                 smtp_use_tls=settings.smtp_use_tls,
+                daily_limit=_initial_daily_limit(settings, None),
             )
         )
 
@@ -271,7 +354,7 @@ def seed_sender_accounts_from_env(db: Session) -> None:
                     smtp_password=entry.get("smtp_password"),
                     smtp_use_tls=entry.get("smtp_use_tls", True),
                     api_key=entry.get("api_key"),
-                    daily_limit=entry.get("daily_limit", 200),
+                    daily_limit=_initial_daily_limit(settings, entry.get("daily_limit")),
                 )
             )
 

@@ -42,8 +42,12 @@ celery_app.conf.beat_schedule = {
         "task": "app.tasks.celery_tasks.follow_up_sequence_task",
         "schedule": 1800.0,  # every 30 minutes
     },
-    "bounce-health-check": {
-        "task": "app.tasks.celery_tasks.bounce_health_check_task",
+    "sender-health-check": {
+        "task": "app.tasks.celery_tasks.sender_health_check_task",
         "schedule": 900.0,  # every 15 minutes
+    },
+    "warmup-rotation": {
+        "task": "app.tasks.celery_tasks.warmup_rotation_task",
+        "schedule": 86400.0,  # once a day
     },
 }

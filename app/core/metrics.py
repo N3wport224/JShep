@@ -3,7 +3,7 @@
 without pulling in FastAPI - the /metrics route in app/main.py just exposes
 whatever has been recorded via prometheus_client's default registry.
 """
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 email_dispatch_total = Counter(
     "sdr_email_dispatch_total",
@@ -66,6 +66,31 @@ variant_reply_total = Counter(
 )
 variant_positive_total = Counter(
     "sdr_variant_positive_total", "Positive-sentiment replies per A/B campaign variant", ["campaign", "variant"]
+)
+
+sender_spam_complaint_rate = Histogram(
+    "sdr_sender_spam_complaint_rate",
+    "Observed spam-complaint rate per sender account at time of send",
+    ["sender_account"],
+    buckets=(0, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.05),
+)
+
+sender_warmup_stage = Gauge(
+    "sdr_sender_warmup_stage",
+    "Current inbox-warmup stage per sender account (higher = more ramped up)",
+    ["sender_account"],
+)
+
+sender_daily_limit = Gauge(
+    "sdr_sender_daily_limit",
+    "Current daily send limit per sender account (ramps up during warmup)",
+    ["sender_account"],
+)
+
+linkedin_touchpoint_total = Counter(
+    "sdr_linkedin_touchpoint_total",
+    "LinkedIn touchpoint executions handed to the automation layer",
+    ["action", "status"],  # action: linkedin_view|linkedin_connection, status: executed|failed|simulated
 )
 
 

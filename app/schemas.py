@@ -4,7 +4,16 @@ from typing import Optional
 
 from pydantic import BaseModel, EmailStr, Field
 
-from app.models import ApprovalStatus, LeadStatus, MessageStatus, Sentiment, SuppressionSource
+from app.models import (
+    ApprovalStatus,
+    ChannelType,
+    LeadStatus,
+    MessageStatus,
+    SenderProvider,
+    Sentiment,
+    SuppressionSource,
+    TouchpointStatus,
+)
 
 
 class LeadIn(BaseModel):
@@ -173,5 +182,65 @@ class CampaignOut(BaseModel):
     description: Optional[str]
     created_at: datetime
     variants: list[CampaignVariantOut]
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Sender health guardian
+# ---------------------------------------------------------------------------
+
+
+class SenderAccountOut(BaseModel):
+    id: str
+    name: str
+    provider: SenderProvider
+    is_paused: bool
+    pause_reason: Optional[str]
+    daily_limit: int
+    sent_count: int
+    bounce_count: int
+    open_count: int
+    spam_complaint_count: int
+    bounce_rate: float
+    open_rate: float
+    spam_complaint_rate: float
+    warmup_stage: int
+    warmup_complete: bool
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Multi-channel sequencing (email + LinkedIn)
+# ---------------------------------------------------------------------------
+
+
+class SequenceStepIn(BaseModel):
+    step_number: int = Field(ge=1)
+    channel: ChannelType = ChannelType.EMAIL
+    delay_days: int = Field(ge=0)
+
+
+class SequenceStepOut(BaseModel):
+    id: str
+    campaign_id: Optional[str]
+    step_number: int
+    channel: ChannelType
+    delay_days: int
+
+    model_config = {"from_attributes": True}
+
+
+class LinkedInTouchpointOut(BaseModel):
+    id: str
+    lead_id: str
+    sequence_step: int
+    action: ChannelType
+    status: TouchpointStatus
+    external_reference: Optional[str]
+    error: Optional[str]
+    scheduled_at: datetime
+    executed_at: Optional[datetime]
 
     model_config = {"from_attributes": True}

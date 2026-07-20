@@ -232,9 +232,20 @@ class SenderAccount(Base):
     daily_limit: Mapped[int] = mapped_column(Integer, default=200)
     sent_count: Mapped[int] = mapped_column(Integer, default=0)
     bounce_count: Mapped[int] = mapped_column(Integer, default=0)
+    open_count: Mapped[int] = mapped_column(Integer, default=0)
+    spam_complaint_count: Mapped[int] = mapped_column(Integer, default=0)
     is_paused: Mapped[bool] = mapped_column(Boolean, default=False)
     pause_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Inbox warmup: daily_limit ramps up over app.services.warmup's
+    # configured stages instead of starting at full volume on day one -
+    # this is what actually protects deliverability for a brand-new sending
+    # identity, on top of the reactive bounce/spam-complaint circuit breaker.
+    warmup_stage: Mapped[int] = mapped_column(Integer, default=0)
+    warmup_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    counters_reset_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     @property
@@ -242,6 +253,18 @@ class SenderAccount(Base):
         if self.sent_count == 0:
             return 0.0
         return self.bounce_count / self.sent_count
+
+    @property
+    def open_rate(self) -> float:
+        if self.sent_count == 0:
+            return 0.0
+        return self.open_count / self.sent_count
+
+    @property
+    def spam_complaint_rate(self) -> float:
+        if self.sent_count == 0:
+            return 0.0
+        return self.spam_complaint_count / self.sent_count
 
 
 class SuppressionSource(str, enum.Enum):
@@ -322,3 +345,65 @@ class CampaignVariant(Base):
     @property
     def positive_rate(self) -> float:
         return self.positive_count / self.sent_count if self.sent_count else 0.0
+
+
+class ChannelType(str, enum.Enum):
+    EMAIL = "email"
+    LINKEDIN_VIEW = "linkedin_view"
+    LINKEDIN_CONNECTION = "linkedin_connection"
+
+
+class SequenceStepConfig(Base):
+    """
+    A multi-channel outreach sequence blueprint: an ordered list of steps,
+    each either an email send (handled by the existing follow-up email
+    generation path) or a LinkedIn touchpoint (handled by
+    app.services.linkedin_automation). `campaign_id` NULL means this step
+    applies to every lead not otherwise assigned a campaign-specific
+    sequence - see app.tasks.celery_tasks.follow_up_sequence_task.
+    """
+
+    __tablename__ = "sequence_step_configs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    campaign_id: Mapped[str | None] = mapped_column(ForeignKey("campaigns.id"), nullable=True)
+    step_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    channel: Mapped[ChannelType] = mapped_column(Enum(ChannelType), default=ChannelType.EMAIL)
+    delay_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class TouchpointStatus(str, enum.Enum):
+    PENDING = "pending"
+    QUEUED = "queued"
+    EXECUTED = "executed"
+    FAILED = "failed"
+
+
+class LinkedInTouchpoint(Base):
+    """
+    One scheduled/executed LinkedIn action (profile view or connection
+    request) for a lead, as part of its multi-channel sequence. This never
+    touches LinkedIn directly - app.services.linkedin_automation formats and
+    ships a payload to an external headless-browser automation layer
+    (PhantomBuster, a local Playwright worker, etc.) configured via
+    LINKEDIN_AUTOMATION_WEBHOOK_URL; with no webhook configured, execution
+    is safely simulated (logged, marked executed) so sequences don't stall
+    in dev/test.
+    """
+
+    __tablename__ = "linkedin_touchpoints"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    lead_id: Mapped[str] = mapped_column(ForeignKey("leads.id"), nullable=False)
+    sequence_step: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[ChannelType] = mapped_column(Enum(ChannelType), nullable=False)
+    status: Mapped[TouchpointStatus] = mapped_column(Enum(TouchpointStatus), default=TouchpointStatus.PENDING)
+    payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+    external_reference: Mapped[str | None] = mapped_column(String, nullable=True)
+    error: Mapped[str | None] = mapped_column(String, nullable=True)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    lead: Mapped["Lead"] = relationship(lazy="selectin")

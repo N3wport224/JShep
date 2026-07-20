@@ -19,7 +19,20 @@ from app.core.logging import configure_logging, get_logger, new_request_id, requ
 from app.core.security import auth_is_configured, limiter
 from app.database import init_db
 from app.db_sync import SessionLocalSync
-from app.routers import approvals, auth, campaigns, dashboard, inbound, leads, outbound, suppression, telegram, tracking
+from app.routers import (
+    approvals,
+    auth,
+    campaigns,
+    dashboard,
+    inbound,
+    leads,
+    outbound,
+    senders,
+    sequences,
+    suppression,
+    telegram,
+    tracking,
+)
 from app.services.sender_rotation import seed_sender_accounts_from_env
 
 configure_logging()
@@ -62,9 +75,10 @@ app = FastAPI(
         "strict human-in-the-loop approval gate for any AI-drafted reply. "
         "Postgres + Celery/Redis backed, with resilience, agentic reply drafting, "
         "full observability, CRM/calendar integration, a global compliance "
-        "suppression list, and campaign A/B testing."
+        "suppression list, campaign A/B testing, sender health/warmup guardian, "
+        "multi-channel (email + LinkedIn) sequencing, and a real-time funnel dashboard."
     ),
-    version="3.0.0",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
@@ -95,6 +109,8 @@ app.include_router(telegram.router)
 app.include_router(dashboard.router)
 app.include_router(suppression.router)
 app.include_router(campaigns.router)
+app.include_router(senders.router)
+app.include_router(sequences.router)
 
 
 @app.get("/health")

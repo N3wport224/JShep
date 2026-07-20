@@ -1,0 +1,125 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="refresh" content="20" />
+  <title>AI SDR Funnel Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    h2 { font-size: 1.1rem; margin-top: 2.5rem; border-bottom: 1px solid #eee; padding-bottom: 0.4rem; }
+    .subtitle { color: #666; font-size: 0.85rem; margin-bottom: 1.5rem; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.75rem; }
+    .stat-card { border: 1px solid #ddd; border-radius: 8px; padding: 0.9rem; text-align: center; }
+    .stat-card .value { font-size: 1.6rem; font-weight: 700; }
+    .stat-card .label { font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 0.03em; }
+    table { border-collapse: collapse; width: 100%; margin-top: 0.75rem; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #eee; }
+    th { color: #666; font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.78rem; }
+    .badge.active { background: #d4edda; color: #155724; }
+    .badge.paused { background: #f8d7da; color: #721c24; }
+    .badge.pending { background: #fff3cd; }
+    .badge.approved, .badge.sent { background: #d4edda; }
+    .badge.rejected { background: #f8d7da; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    a.button { display: inline-block; margin-top: 0.5rem; margin-right: 0.5rem; padding: 6px 14px; border-radius: 4px; text-decoration: none; }
+    .approve { background: #198754; color: white; }
+    .reject { background: #dc3545; color: white; }
+    pre { white-space: pre-wrap; background: #f7f7f7; padding: 0.5rem; border-radius: 4px; margin: 0.3rem 0; }
+    .muted { color: #888; }
+  </style>
+</head>
+<body>
+  <h1>AI SDR Funnel Dashboard</h1>
+  <p class="subtitle">Auto-refreshes every 20s. All rates are computed live from the database, not cached.</p>
+
+  <h2>Lead Funnel</h2>
+  <div class="cards">
+    <div class="stat-card"><div class="value">{{ stats.total_leads }}</div><div class="label">Total Leads</div></div>
+    {% for status_name in ["new", "enriched", "sent", "opened", "replied", "bounced", "opted_out", "closed_won"] %}
+    <div class="stat-card">
+      <div class="value">{{ stats.leads_by_status.get(status_name, 0) }}</div>
+      <div class="label">{{ status_name.replace("_", " ") }}</div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <h2>Delivery & Engagement Rates</h2>
+  <div class="cards">
+    <div class="stat-card"><div class="value">{{ "%.1f"|format(stats.enrichment_rate * 100) }}%</div><div class="label">Enrichment Rate</div></div>
+    <div class="stat-card"><div class="value">{{ stats.messages_sent }}</div><div class="label">Emails Sent</div></div>
+    <div class="stat-card"><div class="value">{{ "%.1f"|format(stats.open_rate * 100) }}%</div><div class="label">Open Rate</div></div>
+    <div class="stat-card"><div class="value">{{ "%.1f"|format(stats.reply_rate * 100) }}%</div><div class="label">Reply Rate</div></div>
+    <div class="stat-card"><div class="value">{{ "%.2f"|format(stats.bounce_rate * 100) }}%</div><div class="label">Bounce Rate</div></div>
+    <div class="stat-card"><div class="value">{{ stats.touchpoints_by_status.get("executed", 0) }}</div><div class="label">LinkedIn Touchpoints</div></div>
+  </div>
+
+  <h2>Sender Health Guardian</h2>
+  {% if not senders %}
+  <p class="muted">No sender accounts configured yet.</p>
+  {% else %}
+  <table>
+    <tr>
+      <th>Account</th><th>Provider</th><th>Status</th><th>Warmup</th><th>Daily Limit</th>
+      <th>Sent</th><th>Bounce %</th><th>Open %</th><th>Spam %</th>
+    </tr>
+    {% for s in senders %}
+    <tr>
+      <td>{{ s.name }}</td>
+      <td>{{ s.provider.value }}</td>
+      <td>
+        {% if s.is_paused %}<span class="badge paused">paused</span>{% else %}<span class="badge active">active</span>{% endif %}
+        {% if s.pause_reason %}<div class="muted" style="font-size:0.75rem">{{ s.pause_reason }}</div>{% endif %}
+      </td>
+      <td>{{ "complete" if s.warmup_complete else "stage " ~ s.warmup_stage }}</td>
+      <td>{{ s.daily_limit }}</td>
+      <td>{{ s.sent_count }}</td>
+      <td>{{ "%.2f"|format(s.bounce_rate * 100) }}%</td>
+      <td>{{ "%.1f"|format(s.open_rate * 100) }}%</td>
+      <td>{{ "%.3f"|format(s.spam_complaint_rate * 100) }}%</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted" style="font-size:0.8rem">Pause/unpause via POST /senders/{id}/pause|unpause (X-API-Key or bearer token).</p>
+  {% endif %}
+
+  <h2>A/B Campaign Variant Performance</h2>
+  {% if not campaigns %}
+  <p class="muted">No campaigns configured yet.</p>
+  {% endif %}
+  {% for c in campaigns %}
+  <p><strong>{{ c.name }}</strong>{% if c.description %} &mdash; {{ c.description }}{% endif %}</p>
+  <table>
+    <tr><th>Variant</th><th>Hook</th><th>Sent</th><th>Open Rate</th><th>Reply Rate</th><th>Positive Rate</th></tr>
+    {% for v in c.variants %}
+    <tr>
+      <td>{{ v.label }}</td>
+      <td class="muted">{{ v.prompt_hint or "—" }}</td>
+      <td>{{ v.sent_count }}</td>
+      <td>{{ "%.1f"|format(v.open_rate * 100) }}%</td>
+      <td>{{ "%.1f"|format(v.reply_rate * 100) }}%</td>
+      <td>{{ "%.1f"|format(v.positive_rate * 100) }}%</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endfor %}
+
+  <h2>Pending Approval Queue ({{ approvals|length }})</h2>
+  {% if not approvals %}
+  <p class="muted">No approvals waiting.</p>
+  {% endif %}
+  {% for a in approvals %}
+  <div class="card">
+    <div><span class="badge {{ a.status.value }}">{{ a.status.value }}</span></div>
+    <p><strong>{{ a.lead.contact_name }}</strong> &mdash; {{ a.lead.company_name }} ({{ a.lead.email }})</p>
+    <p class="muted">Their reply:</p>
+    <pre>{{ a.reply.raw_body }}</pre>
+    <p class="muted">AI drafted response:</p>
+    <pre>{{ a.drafted_response }}</pre>
+    <a class="button approve" href="/approvals/{{ a.id }}/decision?token={{ a.approval_token }}&action=approve">Approve &amp; Send</a>
+    <a class="button reject" href="/approvals/{{ a.id }}/decision?token={{ a.approval_token }}&action=reject">Reject / Take Over</a>
+  </div>
+  {% endfor %}
+</body>
+</html>

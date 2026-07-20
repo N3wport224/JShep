@@ -66,8 +66,19 @@ class Settings(BaseSettings):
     #   "smtp_password":"...","from_email":"...","from_name":"...","daily_limit":100}]
     sender_accounts_json: Optional[str] = None
     # Pause a sending account automatically once its bounce rate exceeds this.
-    bounce_rate_pause_threshold: float = 0.05
+    bounce_rate_pause_threshold: float = 0.02
     bounce_rate_min_sample: int = 20
+    # Pause a sending account automatically once its spam-complaint rate
+    # exceeds this (same min-sample guard as bounce rate).
+    spam_complaint_rate_pause_threshold: float = 0.001
+
+    # --- Inbox warmup: daily_limit ramps through these stages instead of a
+    # new sender account blasting at full volume from day one. Advanced by
+    # the daily warmup_rotation_task; also resets sent/bounce/open/spam
+    # counters for the new day so rates reflect a rolling daily window
+    # rather than all-time totals. ---
+    warmup_enabled: bool = True
+    warmup_daily_targets: str = "10,20,40,80,150,200"
 
     # --- Inbound email (IMAP) - default account used by the poller ---
     imap_host: Optional[str] = None
@@ -108,6 +119,15 @@ class Settings(BaseSettings):
     # A static booking link (Cal.com or a Google Calendar appointment
     # schedule link both work) offered to prospects who ask to book a call.
     calendar_booking_url: Optional[str] = None
+
+    # --- LinkedIn touchpoint automation (see app.services.linkedin_automation) ---
+    # Endpoint for a headless-browser automation layer (PhantomBuster, a
+    # local Playwright worker) that actually performs profile views/connection
+    # requests. Left unset, execution is safely simulated (logged only) so
+    # multi-channel sequences work end to end in dev/test without a real
+    # browser automation backend.
+    linkedin_automation_webhook_url: Optional[str] = None
+    linkedin_automation_api_key: Optional[str] = None
 
 
 @lru_cache
