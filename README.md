@@ -435,7 +435,65 @@ websockets):
 - At least one of: a Telegram bot, a Discord webhook, or a generic webhook
   endpoint (or just use the built-in dashboard at `/dashboard`)
 
-## Local setup
+## Quick start (automated setup script)
+
+For a non-technical user getting this running locally for the first time,
+the fastest path is one of the two setup scripts in the repo root. Each one
+checks for Docker, creates `.env` from `.env.example` and interactively
+asks for the handful of credentials most people need, then builds, starts,
+and migrates the whole stack automatically.
+
+**macOS / Linux:**
+
+```bash
+./setup.sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+.\setup.ps1
+```
+
+If Windows blocks the script from running (`running scripts is disabled on
+this system`), either run it via
+`powershell -ExecutionPolicy Bypass -File .\setup.ps1`, or allow local
+scripts once with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
+What the script does, in order:
+
+1. **Prerequisite checks** - confirms Docker and Docker Compose are
+   installed and the Docker daemon is running. If not, it prints
+   step-by-step Docker Desktop install instructions for your OS and exits
+   (no partial setup left behind).
+2. **Environment configuration** - if `.env` doesn't exist yet, copies it
+   from `.env.example` and walks you through the credentials that matter
+   most to get sending/receiving working: your Anthropic API key, Outlook
+   SMTP/IMAP email + password (or app password), a HubSpot access token
+   (optional, for CRM sync), and a Google Places API key (optional, for
+   automated lead discovery). Press Enter on any prompt to skip it and
+   fill it in later by editing `.env` directly. A secure random
+   `ADMIN_API_KEY` and `JWT_SECRET` are generated automatically. If `.env`
+   already exists, the script leaves it alone and just boots the stack -
+   pass `--reconfigure` (`-Reconfigure` on Windows) to re-run the prompts,
+   or `--yes` (`-Yes`) to skip all prompts non-interactively.
+3. **Automated boot & database migration** - runs
+   `docker compose up --build -d` to start Postgres, Redis, the FastAPI
+   app, a Celery worker, and Celery beat; waits for Postgres to report
+   healthy, then waits for the one-shot `migrate` container (which runs
+   `alembic upgrade head`) to finish successfully; then waits for the API
+   to respond.
+
+On success it prints the dashboard URL
+(`http://localhost:8000/dashboard`), your generated admin key, and how to
+open the approval queue - the human-in-the-loop review screen for
+AI-drafted replies waiting on your sign-off.
+
+Re-run `./setup.sh` / `.\setup.ps1` any time - with an existing `.env` it
+just rebuilds and restarts the stack, safe to use as your normal "start
+the app" command.
+
+## Local setup (manual)
 
 ```bash
 cp .env.example .env
