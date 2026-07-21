@@ -146,13 +146,24 @@ class Settings(BaseSettings):
     # directory API, never raw scraping of a site that prohibits it.
     lead_discovery_enabled: bool = False
     google_places_api_key: Optional[str] = None
-    # JSON array of {"campaign_name": str, "search_query": str, "daily_count": int}.
-    # One discovery pass per entry, once daily. daily_count defaults to 25 if
-    # omitted. campaign_name is looked up (or auto-created with one default
-    # variant, if missing) so discovered leads get the right A/B assignment.
+    # JSON array of {"campaign_name": str, "search_queries": [str, ...], "daily_count": int}
+    # ("search_query": str also accepted for a single query). Each query in
+    # search_queries is searched in turn and results are deduplicated and
+    # accumulated until daily_count unique businesses are found - several
+    # narrow, on-target queries per vertical consistently beat one broad
+    # combined query. campaign_name is looked up (or auto-created with one
+    # default variant, if missing) so discovered leads get the right A/B
+    # assignment. Tune these to Jeff's actual targeting as it evolves.
     lead_discovery_campaigns_json: str = (
-        '[{"campaign_name":"FFY","search_query":"restaurants bars cafes coffee shops","daily_count":25},'
-        '{"campaign_name":"Tip Tax Refund","search_query":"restaurants high volume credit card processing","daily_count":25}]'
+        '['
+        '{"campaign_name":"FFY","daily_count":25,"search_queries":['
+        '"full-service restaurants","bars and pubs","cafes and coffee shops",'
+        '"breweries and taprooms","nightclubs and lounges"]},'
+        '{"campaign_name":"Tip Tax Refund","daily_count":25,"search_queries":['
+        '"full-service restaurants with table service","bars and nightclubs",'
+        '"hotel restaurants and room service","casino dining and bars",'
+        '"banquet halls and event catering venues"]}'
+        ']'
     )
     # Owner-contact enrichment is never fabricated. Configure your own
     # provider (Hunter.io, Apollo, Clearbit, an internal data source, etc.)

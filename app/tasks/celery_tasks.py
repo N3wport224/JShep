@@ -600,13 +600,13 @@ def discover_leads_task(campaign_name: str | None = None, force: bool = False) -
     try:
         for config in configs:
             name = config.get("campaign_name")
-            query = config.get("search_query")
+            queries = config.get("search_queries")
             count = config.get("daily_count", 25)
-            if not name or not query:
+            if not name or not queries:
                 logger.warning("discover_leads_task: skipping malformed campaign config: %s", config)
                 continue
 
-            run, new_leads = run_discovery_for_campaign(db, name, query, daily_count=count)
+            run, new_leads = run_discovery_for_campaign(db, name, queries, daily_count=count)
             for lead in new_leads:
                 enrich_lead_task.delay(lead.id)
 

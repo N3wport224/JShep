@@ -8,6 +8,7 @@ from app.config import get_settings
 from app.models import Campaign, DiscoveryRun, DiscoveryRunStatus, Lead
 from app.services.lead_discovery import (
     DiscoveredBusiness,
+    GooglePlacesSearch,
     LeadDiscoveryError,
     NullContactEnrichment,
     OwnerContact,
@@ -62,6 +63,27 @@ def test_parse_discovery_campaigns_default_includes_ffy_and_tip_tax_refund():
     assert "Tip Tax Refund" in names
     for c in configs:
         assert c["daily_count"] == 25
+        # each vertical is covered by several precise queries, not one
+        # broad combined query
+        assert len(c["search_queries"]) >= 3
+        assert all(isinstance(q, str) and q for q in c["search_queries"])
+
+
+def test_parse_discovery_campaigns_normalizes_single_search_query_string():
+    from copy import copy
+
+    settings = copy(get_settings())
+    settings.lead_discovery_campaigns_json = '[{"campaign_name":"X","search_query":"restaurants","daily_count":10}]'
+    configs = parse_discovery_campaigns(settings)
+    assert configs == [{"campaign_name": "X", "search_queries": ["restaurants"], "daily_count": 10}]
+
+
+def test_parse_discovery_campaigns_skips_entries_with_no_queries():
+    from copy import copy
+
+    settings = copy(get_settings())
+    settings.lead_discovery_campaigns_json = '[{"campaign_name":"X","daily_count":10}]'
+    assert parse_discovery_campaigns(settings) == []
 
 
 def test_parse_discovery_campaigns_handles_invalid_json():
@@ -138,10 +160,10 @@ def test_run_discovery_skips_duplicate_existing_lead(sync_db):
 
 
 def test_run_discovery_respects_daily_count_cap(sync_db):
-    businesses = [_business(name=f"Biz {i}", external_id=str(i)) for i in range(40)]
+    businesses = [_business(name=f"Biz {i}", external_id=str(i), website=f"https://biz{i}.example.net") for i in range(40)]
     search = _FakeSearch(businesses)
     enrichment = _FakeEnrichment(
-        {b.name: OwnerContact(contact_name="Owner", email=f"owner{i}@example.com") for i, b in enumerate(businesses)}
+        {b.name: OwnerContact(contact_name="Owner", email=f"owner{i}@biz{i}.example.net") for i, b in enumerate(businesses)}
     )
 
     run, new_leads = run_discovery_for_campaign(
@@ -181,6 +203,110 @@ def test_run_discovery_records_failed_run_on_search_provider_error(sync_db):
     assert run.error
     assert new_leads == []
     assert sync_db.query(DiscoveryRun).filter_by(status=DiscoveryRunStatus.FAILED).count() == 1
+
+
+def test_run_discovery_rotates_through_multiple_queries_until_daily_count_met(sync_db):
+    biz_a = _business(name="Biz A", external_id="a", website="https://biza.example.net")
+    biz_b = _business(name="Biz B", external_id="b", website="https://bizb.example.net")
+
+    class _MultiQuerySearch:
+        def __init__(self):
+            self.calls = []
+
+        def search(self, query, count):
+            self.calls.append((query, count))
+            return {"bars": [biz_a], "cafes": [biz_b]}.get(query, [])
+
+    search = _MultiQuerySearch()
+    enrichment = _FakeEnrichment(
+        {
+            "Biz A": OwnerContact(contact_name="A", email="a@bizA.example.com"),
+            "Biz B": OwnerContact(contact_name="B", email="b@bizB.example.com"),
+        }
+    )
+    run, new_leads = run_discovery_for_campaign(
+        sync_db, "FFY", ["bars", "cafes"], daily_count=25, search_provider=search, enrichment_provider=enrichment
+    )
+    # first query gets the full remaining budget; second only asks for what's left
+    assert search.calls == [("bars", 25), ("cafes", 24)]
+    assert run.businesses_found == 2
+    assert run.leads_created == 2
+    assert {lead.company_name for lead in new_leads} == {"Biz A", "Biz B"}
+
+
+def test_run_discovery_stops_querying_once_daily_count_reached(sync_db):
+    businesses = [_business(name=f"Biz {i}", external_id=str(i)) for i in range(25)]
+
+    class _MultiQuerySearch:
+        def __init__(self):
+            self.calls = []
+
+        def search(self, query, count):
+            self.calls.append((query, count))
+            return businesses[:count]
+
+    search = _MultiQuerySearch()
+    run, _ = run_discovery_for_campaign(
+        sync_db, "FFY", ["restaurants", "bars"], daily_count=25,
+        search_provider=search, enrichment_provider=NullContactEnrichment(),
+    )
+    # the second query is never issued - the first already filled daily_count
+    assert search.calls == [("restaurants", 25)]
+    assert run.businesses_found == 25
+
+
+def test_run_discovery_dedups_same_business_seen_across_queries(sync_db):
+    biz = _business(name="Joe's Diner", external_id="place-1")
+
+    class _OverlappingSearch:
+        def search(self, query, count):
+            return [biz]
+
+    search = _OverlappingSearch()
+    enrichment = _FakeEnrichment({"Joe's Diner": OwnerContact(contact_name="Joe", email="joe@joesdiner.example.com")})
+    run, new_leads = run_discovery_for_campaign(
+        sync_db, "FFY", ["restaurants", "bars", "cafes"], daily_count=25,
+        search_provider=search, enrichment_provider=enrichment,
+    )
+    assert run.businesses_found == 1  # same place ID, deduped across the 3 queries
+    assert run.leads_created == 1
+    assert len(new_leads) == 1
+
+
+def test_run_discovery_rejects_malformed_email_as_unverified(sync_db):
+    search = _FakeSearch([_business()])
+    enrichment = _FakeEnrichment({"Joe's Diner": OwnerContact(contact_name="Joe", email="not-an-email")})
+    run, new_leads = run_discovery_for_campaign(
+        sync_db, "FFY", "restaurants", search_provider=search, enrichment_provider=enrichment
+    )
+    assert run.leads_created == 0
+    assert run.no_contact_found == 1
+    assert new_leads == []
+
+
+def test_run_discovery_rejects_junk_placeholder_domain(sync_db):
+    search = _FakeSearch([_business()])
+    enrichment = _FakeEnrichment({"Joe's Diner": OwnerContact(contact_name="Joe", email="owner@example.com")})
+    run, new_leads = run_discovery_for_campaign(
+        sync_db, "FFY", "restaurants", search_provider=search, enrichment_provider=enrichment
+    )
+    assert run.leads_created == 0
+    assert run.no_contact_found == 1
+    assert new_leads == []
+
+
+def test_run_discovery_skips_duplicate_website_even_with_different_email(sync_db):
+    sync_db.add(Lead(company_name="Existing", contact_name="Someone", email="info@joesdiner.example.com", website="https://joesdiner.example.com"))
+    sync_db.commit()
+
+    search = _FakeSearch([_business()])
+    enrichment = _FakeEnrichment({"Joe's Diner": OwnerContact(contact_name="Joe", email="joe.new@joesdiner.example.com")})
+    run, new_leads = run_discovery_for_campaign(
+        sync_db, "FFY", "restaurants", search_provider=search, enrichment_provider=enrichment
+    )
+    assert run.duplicates_skipped == 1
+    assert run.leads_created == 0
+    assert new_leads == []
 
 
 def test_run_discovery_one_bad_enrichment_lookup_does_not_abort_run(sync_db):
@@ -248,3 +374,71 @@ def test_discover_leads_task_filters_to_named_campaign(mock_run, mock_enrich, sy
 def test_discover_leads_task_unknown_campaign_name_returns_not_found(sync_db):
     result = discover_leads_task(campaign_name="Nonexistent Campaign", force=True)
     assert result["status"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# GooglePlacesSearch pagination (a single Places API page caps at 20 results,
+# so satisfying daily_count=25+ requires following nextPageToken)
+# ---------------------------------------------------------------------------
+
+
+def _places_response(names, next_page_token=None):
+    body = {
+        "places": [
+            {
+                "displayName": {"text": name},
+                "formattedAddress": "1 Main St",
+                "websiteUri": f"https://{name.lower().replace(' ', '')}.example.com",
+                "nationalPhoneNumber": "555-0000",
+                "id": name,
+            }
+            for name in names
+        ]
+    }
+    if next_page_token:
+        body["nextPageToken"] = next_page_token
+    return body
+
+
+@patch("app.services.lead_discovery.time.sleep")
+@patch("app.services.lead_discovery.httpx.post")
+def test_google_places_search_pages_past_20_result_cap(mock_post, mock_sleep, monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    page1 = MagicMock(status_code=200)
+    page1.json.return_value = _places_response([f"Biz {i}" for i in range(20)], next_page_token="tok-2")
+    page1.raise_for_status.return_value = None
+    page2 = MagicMock(status_code=200)
+    page2.json.return_value = _places_response([f"Biz {i}" for i in range(20, 25)])
+    page2.raise_for_status.return_value = None
+    mock_post.side_effect = [page1, page2]
+
+    results = GooglePlacesSearch().search("restaurants", 25)
+
+    assert len(results) == 25
+    assert mock_post.call_count == 2
+    second_call_payload = mock_post.call_args_list[1].kwargs["json"]
+    assert second_call_payload["pageToken"] == "tok-2"
+    get_settings.cache_clear()
+
+
+@patch("app.services.lead_discovery.httpx.post")
+def test_google_places_search_stops_at_daily_count_without_extra_page(mock_post, monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    page1 = MagicMock(status_code=200)
+    page1.json.return_value = _places_response([f"Biz {i}" for i in range(10)], next_page_token="tok-2")
+    page1.raise_for_status.return_value = None
+    mock_post.return_value = page1
+
+    results = GooglePlacesSearch().search("restaurants", 10)
+
+    assert len(results) == 10
+    assert mock_post.call_count == 1
+    get_settings.cache_clear()

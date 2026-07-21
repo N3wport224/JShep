@@ -339,31 +339,47 @@ independently pluggable stages, never raw scraping:
 1. **Business search** (`app.services.lead_discovery.BusinessSearchProvider`) -
    defaults to the **Google Places API** (Text Search), a legitimate,
    documented, rate-limited business directory API. Set `GOOGLE_PLACES_API_KEY`.
+   A single Places API page caps at 20 results, so `GooglePlacesSearch`
+   transparently follows `nextPageToken` (up to 3 pages / 60 results) so a
+   `daily_count` above 20 - like the default 25/day - is actually reachable.
 2. **Contact enrichment** (`ContactEnrichmentProvider`) - bring your own
    provider (Hunter.io, Apollo, Clearbit, an internal database, whatever's
    already under contract) behind `CONTACT_ENRICHMENT_WEBHOOK_URL`. It
    receives `{name, address, website, phone}` and must return real contact
    data or nothing - **owner/contact info is never fabricated**. A business
-   with no enrichment provider configured, or no contact found, is skipped
-   entirely (counted in `no_contact_found`, not silently dropped).
+   with no enrichment provider configured, no contact found, or a contact
+   whose email fails format validation or resolves to a placeholder/
+   disposable domain (`example.com`, `mailinator.com`, etc.) is skipped
+   entirely (counted in `no_contact_found`, not silently dropped or queued
+   as an unverified record).
 
 Configure per-campaign targeting via `LEAD_DISCOVERY_CAMPAIGNS_JSON` - out
-of the box this ships with Jeff's two campaigns:
+of the box this ships with Jeff's two campaigns, each covered by several
+precise, vertical-specific queries rather than one broad one:
 
 ```json
 [
-  {"campaign_name": "FFY", "search_query": "restaurants bars cafes coffee shops", "daily_count": 25},
-  {"campaign_name": "Tip Tax Refund", "search_query": "restaurants high volume credit card processing", "daily_count": 25}
+  {"campaign_name": "FFY", "daily_count": 25, "search_queries": [
+    "full-service restaurants", "bars and pubs", "cafes and coffee shops",
+    "breweries and taprooms", "nightclubs and lounges"]},
+  {"campaign_name": "Tip Tax Refund", "daily_count": 25, "search_queries": [
+    "full-service restaurants with table service", "bars and nightclubs",
+    "hotel restaurants and room service", "casino dining and bars",
+    "banquet halls and event catering venues"]}
 ]
 ```
 
-These `search_query` values are starting points targeting "food & beverage/
-tipping businesses" and "high-volume credit card processors" respectively,
-per the original ask - tune them to Jeff's actual ICP criteria. If
-`campaign_name` doesn't already exist, it's auto-created with one default
-"A" variant (so cold-email generation and A/B tracking still work); create
-it yourself first via `POST /campaigns` if you want real A/B variants from
-day one.
+`search_queries` (a `search_query` single-string form is also accepted) is
+searched query-by-query - results are deduplicated by the provider's place
+ID as they accumulate - until `daily_count` unique businesses are found or
+every query is exhausted, so the day's budget isn't wasted re-querying
+once it's already met. These are starting points targeting "food &
+beverage/tipping businesses" and "high-volume credit card processors"
+respectively, per the original ask - tune them to Jeff's actual ICP
+criteria. If `campaign_name` doesn't already exist, it's auto-created with
+one default "A" variant (so cold-email generation and A/B tracking still
+work); create it yourself first via `POST /campaigns` if you want real A/B
+variants from day one.
 
 `discover_leads_task` runs once daily at 08:00 UTC via Celery beat (no-ops
 unless `LEAD_DISCOVERY_ENABLED=true`) - or trigger it on demand regardless
@@ -382,11 +398,21 @@ curl http://localhost:8000/discovery/runs -H "X-API-Key: $ADMIN_API_KEY"
 ```
 
 Every discovered contact still passes through the full suppression check
-(dedup against existing leads and the global do-not-contact list) before a
+(dedup against existing leads by email **and** by normalized website domain
+- so the same business surfacing again under a different contact email
+doesn't get double-queued - plus the global do-not-contact list) before a
 `Lead` is created, and every newly created lead is immediately queued into
 `enrich_lead_task` - campaign A/B variant assignment, the pre-send spam
 guardian, all included automatically, exactly as if it had been uploaded
 by hand. `Lead.source` distinguishes `"discovery"` from `"manual"` leads.
+
+**Zero external CRM dependency:** discovered leads are written straight to
+the same `leads`/`email_messages`/`discovery_runs` tables every other lead
+uses - PostgreSQL is the complete system of record end to end (search →
+enrich → dedup/suppress → draft → send → reply → follow-up). HubSpot sync
+(`CRM_PROVIDER=hubspot`) is optional and off by default (`CRM_PROVIDER=none`)
+- purely a one-way push for leads that reply positively, never a dependency
+for discovery, enrichment, sending, or follow-ups to function.
 
 ## Dashboard
 
