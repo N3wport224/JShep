@@ -139,6 +139,29 @@ class Settings(BaseSettings):
     linkedin_automation_webhook_url: Optional[str] = None
     linkedin_automation_api_key: Optional[str] = None
 
+    # --- Automated lead discovery (see app.services.lead_discovery) ---
+    # Off by default - this costs API credits and creates real Lead rows,
+    # so it's an explicit opt-in. Business search uses the Google Places API
+    # (Text Search) - a legitimate, ToS-compliant, rate-limited business
+    # directory API, never raw scraping of a site that prohibits it.
+    lead_discovery_enabled: bool = False
+    google_places_api_key: Optional[str] = None
+    # JSON array of {"campaign_name": str, "search_query": str, "daily_count": int}.
+    # One discovery pass per entry, once daily. daily_count defaults to 25 if
+    # omitted. campaign_name is looked up (or auto-created with one default
+    # variant, if missing) so discovered leads get the right A/B assignment.
+    lead_discovery_campaigns_json: str = (
+        '[{"campaign_name":"FFY","search_query":"restaurants bars cafes coffee shops","daily_count":25},'
+        '{"campaign_name":"Tip Tax Refund","search_query":"restaurants high volume credit card processing","daily_count":25}]'
+    )
+    # Owner-contact enrichment is never fabricated. Configure your own
+    # provider (Hunter.io, Apollo, Clearbit, an internal data source, etc.)
+    # behind this webhook - it receives a business and must return real
+    # contact data or nothing. Left unset, discovered businesses with no
+    # contact are skipped entirely rather than guessed at.
+    contact_enrichment_webhook_url: Optional[str] = None
+    contact_enrichment_api_key: Optional[str] = None
+
 
 @lru_cache
 def get_settings() -> Settings:

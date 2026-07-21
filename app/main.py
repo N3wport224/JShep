@@ -24,6 +24,7 @@ from app.routers import (
     auth,
     campaigns,
     dashboard,
+    discovery,
     inbound,
     leads,
     outbound,
@@ -76,9 +77,10 @@ app = FastAPI(
         "Postgres + Celery/Redis backed, with resilience, agentic reply drafting, "
         "full observability, CRM/calendar integration, a global compliance "
         "suppression list, campaign A/B testing, sender health/warmup guardian, "
-        "multi-channel (email + LinkedIn) sequencing, and a real-time funnel dashboard."
+        "multi-channel (email + LinkedIn) sequencing, automated lead discovery, "
+        "and a real-time funnel dashboard."
     ),
-    version="4.0.0",
+    version="5.0.0",
     lifespan=lifespan,
 )
 
@@ -111,6 +113,7 @@ app.include_router(suppression.router)
 app.include_router(campaigns.router)
 app.include_router(senders.router)
 app.include_router(sequences.router)
+app.include_router(discovery.router)
 
 
 @app.get("/health")

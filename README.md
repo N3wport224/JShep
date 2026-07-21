@@ -59,6 +59,7 @@ app/
     campaigns.py                         A/B campaign CRUD + per-variant stats
     senders.py                           Sender health guardian admin API (list/pause/unpause)
     sequences.py                         Multi-channel sequence blueprint config (email + LinkedIn)
+    discovery.py                         Automated lead discovery: manual trigger + run history
   services/
     llm.py                    Anthropic/OpenAI wrapper: structured output validation
                                 with self-correction retries, agentic reply loop,
@@ -79,6 +80,7 @@ app/
     linkedin_automation.py                         LinkedIn touchpoint payload formatting + execution stub
     sequencing.py                                    Multi-channel (email/LinkedIn) sequence blueprint resolution
     spam_guardian.py                                   Pre-send spam heuristic scoring + self-correction rewrite loop
+    lead_discovery.py                                    Business search + contact enrichment provider abstractions
   tasks/
     celery_tasks.py            All background task bodies (enrich, send, poll, triage,
                                  follow-up sequence, sender health check, warmup rotation,
@@ -328,6 +330,64 @@ footer link never itself trips the link-density check.
 - `GET /leads/{id}/linkedin-touchpoints` lists a lead's touchpoint history
   (status, payload, external job reference, any error).
 
+## Automated lead discovery
+
+Pulls target businesses on a schedule and feeds them straight into the same
+enrichment/campaign pipeline every other lead goes through - built as two
+independently pluggable stages, never raw scraping:
+
+1. **Business search** (`app.services.lead_discovery.BusinessSearchProvider`) -
+   defaults to the **Google Places API** (Text Search), a legitimate,
+   documented, rate-limited business directory API. Set `GOOGLE_PLACES_API_KEY`.
+2. **Contact enrichment** (`ContactEnrichmentProvider`) - bring your own
+   provider (Hunter.io, Apollo, Clearbit, an internal database, whatever's
+   already under contract) behind `CONTACT_ENRICHMENT_WEBHOOK_URL`. It
+   receives `{name, address, website, phone}` and must return real contact
+   data or nothing - **owner/contact info is never fabricated**. A business
+   with no enrichment provider configured, or no contact found, is skipped
+   entirely (counted in `no_contact_found`, not silently dropped).
+
+Configure per-campaign targeting via `LEAD_DISCOVERY_CAMPAIGNS_JSON` - out
+of the box this ships with Jeff's two campaigns:
+
+```json
+[
+  {"campaign_name": "FFY", "search_query": "restaurants bars cafes coffee shops", "daily_count": 25},
+  {"campaign_name": "Tip Tax Refund", "search_query": "restaurants high volume credit card processing", "daily_count": 25}
+]
+```
+
+These `search_query` values are starting points targeting "food & beverage/
+tipping businesses" and "high-volume credit card processors" respectively,
+per the original ask - tune them to Jeff's actual ICP criteria. If
+`campaign_name` doesn't already exist, it's auto-created with one default
+"A" variant (so cold-email generation and A/B tracking still work); create
+it yourself first via `POST /campaigns` if you want real A/B variants from
+day one.
+
+`discover_leads_task` runs once daily at 08:00 UTC via Celery beat (no-ops
+unless `LEAD_DISCOVERY_ENABLED=true`) - or trigger it on demand regardless
+of that flag:
+
+```bash
+# Run every configured campaign now
+curl -X POST http://localhost:8000/discovery/run -H "X-API-Key: $ADMIN_API_KEY" -d '{}'
+
+# Just one campaign
+curl -X POST http://localhost:8000/discovery/run -H "X-API-Key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" -d '{"campaign_name":"FFY"}'
+
+# Run history and outcome counts (found/created/duplicates/suppressed/no-contact)
+curl http://localhost:8000/discovery/runs -H "X-API-Key: $ADMIN_API_KEY"
+```
+
+Every discovered contact still passes through the full suppression check
+(dedup against existing leads and the global do-not-contact list) before a
+`Lead` is created, and every newly created lead is immediately queued into
+`enrich_lead_task` - campaign A/B variant assignment, the pre-send spam
+guardian, all included automatically, exactly as if it had been uploaded
+by hand. `Lead.source` distinguishes `"discovery"` from `"manual"` leads.
+
 ## Dashboard
 
 `GET /dashboard` (admin-protected, pass `?token=<jwt>` or an `X-API-Key`
@@ -352,9 +412,9 @@ websockets):
 - Admin/dashboard routes (`/dashboard`, `/approvals` list/get,
   `/leads/enrich/batch`, `/inbound/poll`, `/tracking/bounce`,
   `/tracking/spam-complaint`, `/suppression`, `/campaigns`, `/senders`,
-  `/sequence-steps`, `/outbound/messages/{id}/approve-review`) require
-  either an `X-API-Key` header or a JWT bearer token (`POST /auth/token`
-  with `ADMIN_USERNAME`/`ADMIN_PASSWORD`).
+  `/sequence-steps`, `/outbound/messages/{id}/approve-review`, `/discovery`)
+  require either an `X-API-Key` header or a JWT bearer token
+  (`POST /auth/token` with `ADMIN_USERNAME`/`ADMIN_PASSWORD`).
 - The approval **decision** endpoints (`/approvals/{id}/decision|approve|reject`)
   and `GET /unsubscribe/{lead_id}` are deliberately *not* behind admin auth -
   they're one-click links sent to a human outside this system (Telegram/
@@ -517,10 +577,13 @@ suppression-list enforcement across every send path, CRM sync success/
 failure/no-op handling, A/B variant assignment determinism + metric
 tracking, multi-channel (email/LinkedIn) sequence resolution and the
 LinkedIn automation stub's simulate-vs-webhook behavior, dashboard
-rendering/auth, and the pre-send spam guardian (trigger-word/punctuation/
+rendering/auth, the pre-send spam guardian (trigger-word/punctuation/
 caps/link-density scoring, the self-correction rewrite loop, and that a
 still-HIGH-risk draft is held as NEEDS_REVIEW and provably cannot reach
-`POST /outbound/send/{id}` without a human clearing it first).
+`POST /outbound/send/{id}` without a human clearing it first), and
+automated lead discovery (dedup/suppression enforcement, the daily-count
+cap, campaign auto-creation, and that a business with no real contact
+found is skipped rather than ever getting a fabricated lead).
 
 ## Error handling notes
 

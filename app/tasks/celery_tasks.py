@@ -27,6 +27,7 @@ from app.schemas import SpamRiskLevel
 from app.services.campaigns import assign_variant, record_sent
 from app.services.email_sender import EmailSendError
 from app.services.imap_listener import IMAPListenerError, fetch_new_replies
+from app.services.lead_discovery import parse_discovery_campaigns, run_discovery_for_campaign
 from app.services.linkedin_automation import LinkedInAutomationError, build_payload, execute_touchpoint
 from app.services.llm import LLMJSONError, get_llm_client
 from app.services.memory import record_outbound
@@ -563,5 +564,68 @@ def send_approved_reply_task(self, approval_id: str) -> dict:
         db.commit()
         logger.info("approved_reply_sent", approval_id=approval_id, lead_id=lead.id)
         return {"approval_id": approval_id, "status": "sent"}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.tasks.celery_tasks.discover_leads_task")
+@with_request_context
+def discover_leads_task(campaign_name: str | None = None, force: bool = False) -> dict:
+    """
+    Daily automated lead discovery (Celery beat, see LEAD_DISCOVERY_ENABLED)
+    or an on-demand admin trigger (POST /discovery/run, which always passes
+    force=True so an explicit admin action isn't silently skipped by the
+    opt-in flag). Runs one discovery pass per campaign configured in
+    LEAD_DISCOVERY_CAMPAIGNS_JSON (Jeff's FFY and Tip Tax Refund campaigns
+    by default), or just the one named by `campaign_name` if given. Every
+    newly created lead is immediately queued into the same enrich_lead_task
+    pipeline every other lead goes through - campaign A/B assignment, the
+    pre-send spam guardian, suppression checks, all included automatically.
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    if not settings.lead_discovery_enabled and not force:
+        logger.info("discover_leads_task: LEAD_DISCOVERY_ENABLED is false, skipping scheduled run")
+        return {"status": "disabled"}
+
+    configs = parse_discovery_campaigns(settings)
+    if campaign_name:
+        configs = [c for c in configs if c.get("campaign_name") == campaign_name]
+        if not configs:
+            return {"status": "not_found", "campaign_name": campaign_name}
+
+    db = SessionLocalSync()
+    results = []
+    try:
+        for config in configs:
+            name = config.get("campaign_name")
+            query = config.get("search_query")
+            count = config.get("daily_count", 25)
+            if not name or not query:
+                logger.warning("discover_leads_task: skipping malformed campaign config: %s", config)
+                continue
+
+            run, new_leads = run_discovery_for_campaign(db, name, query, daily_count=count)
+            for lead in new_leads:
+                enrich_lead_task.delay(lead.id)
+
+            logger.info(
+                "lead_discovery_run_complete",
+                campaign=name,
+                found=run.businesses_found,
+                created=run.leads_created,
+                status=run.status.value,
+            )
+            results.append(
+                {
+                    "campaign_name": name,
+                    "run_id": run.id,
+                    "status": run.status.value,
+                    "businesses_found": run.businesses_found,
+                    "leads_created": run.leads_created,
+                }
+            )
+        return {"status": "ok", "runs": results}
     finally:
         db.close()

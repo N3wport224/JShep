@@ -8,6 +8,7 @@ from pydantic import BaseModel, EmailStr, Field
 from app.models import (
     ApprovalStatus,
     ChannelType,
+    DiscoveryRunStatus,
     LeadStatus,
     MessageStatus,
     SenderProvider,
@@ -63,6 +64,7 @@ class LeadOut(BaseModel):
     campaign_id: Optional[str]
     variant_id: Optional[str]
     crm_contact_id: Optional[str]
+    source: str
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -274,5 +276,31 @@ class LinkedInTouchpointOut(BaseModel):
     error: Optional[str]
     scheduled_at: datetime
     executed_at: Optional[datetime]
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Automated lead discovery
+# ---------------------------------------------------------------------------
+
+
+class DiscoveryTriggerIn(BaseModel):
+    campaign_name: Optional[str] = None
+
+
+class DiscoveryRunOut(BaseModel):
+    id: str
+    campaign_id: Optional[str]
+    campaign_name: str
+    search_query: str
+    businesses_found: int
+    leads_created: int
+    duplicates_skipped: int
+    suppressed_skipped: int
+    no_contact_found: int
+    status: DiscoveryRunStatus
+    error: Optional[str]
+    created_at: datetime
 
     model_config = {"from_attributes": True}

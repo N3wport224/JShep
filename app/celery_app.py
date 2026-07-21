@@ -6,6 +6,7 @@ the periodic jobs, and the FastAPI web layer only ever enqueues tasks, never
 runs LLM/SMTP/IMAP calls inline on the request path.
 """
 from celery import Celery
+from celery.schedules import crontab
 
 from app.config import get_settings
 from app.core.logging import configure_logging
@@ -49,5 +50,13 @@ celery_app.conf.beat_schedule = {
     "warmup-rotation": {
         "task": "app.tasks.celery_tasks.warmup_rotation_task",
         "schedule": 86400.0,  # once a day
+    },
+    "lead-discovery": {
+        "task": "app.tasks.celery_tasks.discover_leads_task",
+        # Once daily at 08:00 UTC - a fixed time (not a rolling interval)
+        # since "pull 25 target businesses daily" reads as a daily quota,
+        # not a from-whenever-the-worker-started cadence. No-ops internally
+        # if LEAD_DISCOVERY_ENABLED is false.
+        "schedule": crontab(hour=8, minute=0),
     },
 }

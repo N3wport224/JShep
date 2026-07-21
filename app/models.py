@@ -62,6 +62,11 @@ class Lead(Base):
     campaign_id: Mapped[str | None] = mapped_column(ForeignKey("campaigns.id"), nullable=True)
     variant_id: Mapped[str | None] = mapped_column(ForeignKey("campaign_variants.id"), nullable=True)
 
+    # Provenance: "manual" (CSV/JSON upload) or "discovery" (see
+    # app.services.lead_discovery - automated daily business search +
+    # owner-contact enrichment).
+    source: Mapped[str] = mapped_column(String, default="manual")
+
     messages: Mapped[list["EmailMessage"]] = relationship(
         back_populates="lead", cascade="all, delete-orphan", lazy="selectin"
     )
@@ -421,3 +426,37 @@ class LinkedInTouchpoint(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     lead: Mapped["Lead"] = relationship(lazy="selectin")
+
+
+class DiscoveryRunStatus(str, enum.Enum):
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+class DiscoveryRun(Base):
+    """
+    Audit record for one automated lead-discovery pass (see
+    app.services.lead_discovery and app.tasks.celery_tasks.discover_leads_task).
+    Never fabricates contact data - businesses_found comes from a real
+    business-search API (Google Places), and leads_created only counts
+    businesses where a configured contact-enrichment provider actually
+    returned a real owner email; everything else is skipped and counted in
+    no_contact_found/duplicates_skipped/suppressed_skipped for transparency.
+    """
+
+    __tablename__ = "discovery_runs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    campaign_id: Mapped[str | None] = mapped_column(ForeignKey("campaigns.id"), nullable=True)
+    campaign_name: Mapped[str] = mapped_column(String, nullable=False)
+    search_query: Mapped[str] = mapped_column(String, nullable=False)
+    businesses_found: Mapped[int] = mapped_column(Integer, default=0)
+    leads_created: Mapped[int] = mapped_column(Integer, default=0)
+    duplicates_skipped: Mapped[int] = mapped_column(Integer, default=0)
+    suppressed_skipped: Mapped[int] = mapped_column(Integer, default=0)
+    no_contact_found: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[DiscoveryRunStatus] = mapped_column(Enum(DiscoveryRunStatus), default=DiscoveryRunStatus.SUCCESS)
+    error: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    campaign: Mapped["Campaign | None"] = relationship(lazy="selectin")
