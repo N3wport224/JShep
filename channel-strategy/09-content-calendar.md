@@ -54,6 +54,9 @@ Each video opens a loop the next one closes, building "The Machine" series spine
 **Non-negotiables:** never publish without a 1-video buffer · thumbnail before final edit (packaging drives content, not vice versa) · every video CTA opens the next video's loop · review retention graphs every Friday against Phase 10 protocol.
 
 ## 90-Day Milestones (sanity targets, not promises)
-- Day 30: 4 longs + 12 Shorts live; ≥ 1,000 subs (monetization threshold via Shorts discovery) 
-- Day 60: watch-hour threshold (4,000h) via long-form; AdSense on
-- Day 90: 8–10 longs; one video should be showing outlier behavior (≥ 3x channel median) — if none is, revisit Phase 3 packaging before making more content. Topic-market fit shows up in packaging CTR first, not production polish.
+
+*Monetization reality check: YouTube Partner Program requires **1,000 subs AND 4,000 public watch hours in the past 12 months** (or 10M Shorts views in 90 days — do not plan around that path; it's a lottery). 4,000 hours ≈ 55–60K views of a 10-minute video at ~45% average viewed. For a from-zero channel, hitting that inside 90 days requires an outlier video — plan for monetization in month 4–6, celebrate if it lands earlier.*
+
+- Day 30: 4 longs + 12 Shorts live, zero missed slots (consistency is the deliverable, not numbers); 200–500 subs is a healthy from-zero start
+- Day 60: ≥ 1,000 subs (Shorts discovery + serial CTAs); 1,000–2,000 cumulative watch hours
+- Day 90: 12–13 longs live; one video showing outlier behavior (≥ 3x channel median views) — if none is, stop and revisit Phase 3 packaging before making more content; topic-market fit shows up in CTR first, not production polish. On-pace channels apply to YPP around month 4–5.

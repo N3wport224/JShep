@@ -59,7 +59,7 @@ You're not a customer with a storage locker. You're a lender. Congratulations �
 
 **VO:** Now it gets stranger. Because when a bank lends your deposit out… your account doesn't go down. You still see your full balance. And the borrower sees their new loan. Which means — count it — there is now *more money* in the system than there was a minute ago.
 
-[GFX: $1,000 becomes $1,000 (your account) + $900 (borrower's account) — total counter ticks up]
+[GFX: $1,000 becomes $1,000 (your account) + $900 (borrower's account) — total counter ticks up. Label the held-back $100 "prudence, not law" — this keeps the example consistent with the 0% requirement established at 1:45]
 
 **VO:** This is the machine's real secret: most money isn't printed. It's *loaned into existence.* Somewhere over ninety percent of the money you'll ever touch was created not by a government press, but by a commercial bank making a loan.
 

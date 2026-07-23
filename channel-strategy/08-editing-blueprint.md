@@ -4,7 +4,7 @@
 **Hand this document to the editor as-is.** VO recorded first; edit to VO. Frame rate 24fps, 4K timeline, exports 1080p+4K.
 
 ## Global Spec
-- **VO delivery:** conversational-forensic. Baseline pace 150 wpm; drop to ~130 wpm for reveals, ~165 wpm for the SVB sequence. Record 10% slower than feels natural; mid-RMS −16 LUFS, no compression "radio voice."
+- **VO delivery:** conversational-forensic. Baseline pace 150 wpm; drop to ~130 wpm for reveals, ~165 wpm for the SVB sequence. Record 10% slower than feels natural; master VO to −16 LUFS integrated loudness, light compression only — no "radio voice."
 - **Music:** 3 cues — A: minimal ticking/mechanical (acts 1–2), B: pulse/tension (act 3), C: warm resolve (act 4/close). Duck −12dB under VO, never silent except scripted dropouts.
 - **Subtitles:** burned-in dynamic captions, 3–5 words at a time, bottom-third, white/bold with keyword color pops (money terms in green, threats in red). Full closed captions uploaded separately.
 - **Cut cadence:** no shot > 5s in acts 1–2, > 3s in act 3, > 6s in act 4. Zoom-punch (3–5%) on every stat.
