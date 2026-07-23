@@ -31,8 +31,12 @@
 | `22-script-video-5-bnpl.md` | Ops | Full production script for video 5 (BNPL / phantom debt) | ✅ Done |
 | `23-script-video-6-stop-paying.md` | Ops | Full production script for video 6 (the default machine) | ✅ Done |
 | `24-packaging-videos-5-6.md` | Ops | Thumbnails, descriptions, tags, pinned comments for videos 5–6 | ✅ Done |
+| `25-script-video-7-insurance.md` | Ops | Full production script for video 7 (the insurance machine / the float) | ✅ Done |
+| `26-script-video-8-credit-cards.md` | Ops | Full production script for video 8 (credit cards / Marquette; season capstone) | ✅ Done |
+| `27-packaging-videos-7-8.md` | Ops | Thumbnails, descriptions, tags, pinned comments for videos 7–8 | ✅ Done |
+| `28-shorts-pack-2.md` | Ops | Shorts S13–S22 for accelerated weeks 3–4 (feeds V5–V8) | ✅ Done |
 
-**Production status:** 6 of 8 accelerated-month long-forms fully scripted + packaged (V1–V6); V7 Insurance and V8 Credit Card Machine next in queue (`21` §5). Cadence: 2 long-forms/week (Tue+Fri) + 5 Shorts/week per the accelerated calendar. The only remaining inputs are human: record, edit, publish.
+**Production status: the full accelerated month is production-ready.** 8 long-form scripts (05, 12, 17, 18, 22, 23, 25, 26), 22 Shorts (13, 28), all packaging & metadata (06, 14, 19, 24, 27), cadence & guardrails (21), launch path (20). Video 8 closes with the fully-assembled master schematic (channel-trailer seed) and opens V9 = Mortgage. The only remaining inputs are human: record, edit, publish.
 
 ## Video 1 at a glance
 - **Title:** Your Bank Doesn't Have Your Money (Here's What It Does Instead)
