@@ -17,6 +17,12 @@
 | `08-editing-blueprint.md` | 8 | Second-by-second editor handoff doc + attention-drop defenses | ✅ Done |
 | `09-content-calendar.md` | 9 | 30-day calendar, Shorts/repurposing strategy, solo batching workflow | ✅ Done |
 | `10-performance-analysis.md` | 10 | Post-publish diagnosis protocol + benchmarks | ⏳ Activates when video 1 has analytics |
+| `11-brand-kit.md` | Ops | Visual/audio/voice identity system, thumbnail grammar, channel meta | ✅ Done |
+| `12-script-video-2-the-fed.md` | Ops | Full production script for video 2 (pays off video 1's sequel loop) | ✅ Done |
+| `13-shorts-scripts.md` | Ops | All 12 month-1 Shorts: scripts, recut specs, ops rules | ✅ Done |
+| `14-upload-metadata.md` | Ops | Descriptions, tags, chapters, pinned comments for videos 1–2 + reusable template | ✅ Done |
+| `15-production-sop.md` | Ops | Script skeleton, fact-check protocol, QC checklist, tool stack, weekly rhythm | ✅ Done |
+| `16-monetization-playbook.md` | Ops | Stage-gated revenue plan (AdSense → affiliates → sponsors → products) + trust rules | ✅ Done |
 
 ## Video 1 at a glance
 - **Title:** Your Bank Doesn't Have Your Money (Here's What It Does Instead)
