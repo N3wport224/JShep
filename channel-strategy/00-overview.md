@@ -23,6 +23,12 @@
 | `14-upload-metadata.md` | Ops | Descriptions, tags, chapters, pinned comments for videos 1–2 + reusable template | ✅ Done |
 | `15-production-sop.md` | Ops | Script skeleton, fact-check protocol, QC checklist, tool stack, weekly rhythm | ✅ Done |
 | `16-monetization-playbook.md` | Ops | Stage-gated revenue plan (AdSense → affiliates → sponsors → products) + trust rules | ✅ Done |
+| `17-script-video-3-credit-score.md` | Ops | Full production script for video 3 (credit score machine) | ✅ Done |
+| `18-script-video-4-prices.md` | Ops | Full production script for video 4 (the price ratchet; opens BNPL loop) | ✅ Done |
+| `19-packaging-videos-3-4.md` | Ops | Thumbnails, descriptions, tags, pinned comments for videos 3–4 | ✅ Done |
+| `20-launch-checklist.md` | Ops | Day-zero → first-upload execution checklist + pre-registered success/kill criteria | ✅ Done |
+
+**Month 1 is now fully production-ready:** 4 long-form scripts (05, 12, 17, 18), 12 Shorts (13), all packaging & metadata (06, 14, 19), and the launch path (20). The only remaining inputs are human: record, edit, publish.
 
 ## Video 1 at a glance
 - **Title:** Your Bank Doesn't Have Your Money (Here's What It Does Instead)
