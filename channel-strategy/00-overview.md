@@ -27,8 +27,12 @@
 | `18-script-video-4-prices.md` | Ops | Full production script for video 4 (the price ratchet; opens BNPL loop) | ✅ Done |
 | `19-packaging-videos-3-4.md` | Ops | Thumbnails, descriptions, tags, pinned comments for videos 3–4 | ✅ Done |
 | `20-launch-checklist.md` | Ops | Day-zero → first-upload execution checklist + pre-registered success/kill criteria | ✅ Done |
+| `21-accelerated-calendar.md` | Ops | **2x cadence plan (Tue+Fri)** — flag-risk truth table, throttle rules, script queue | ✅ Done — supersedes Phase 9 pacing |
+| `22-script-video-5-bnpl.md` | Ops | Full production script for video 5 (BNPL / phantom debt) | ✅ Done |
+| `23-script-video-6-stop-paying.md` | Ops | Full production script for video 6 (the default machine) | ✅ Done |
+| `24-packaging-videos-5-6.md` | Ops | Thumbnails, descriptions, tags, pinned comments for videos 5–6 | ✅ Done |
 
-**Month 1 is now fully production-ready:** 4 long-form scripts (05, 12, 17, 18), 12 Shorts (13), all packaging & metadata (06, 14, 19), and the launch path (20). The only remaining inputs are human: record, edit, publish.
+**Production status:** 6 of 8 accelerated-month long-forms fully scripted + packaged (V1–V6); V7 Insurance and V8 Credit Card Machine next in queue (`21` §5). Cadence: 2 long-forms/week (Tue+Fri) + 5 Shorts/week per the accelerated calendar. The only remaining inputs are human: record, edit, publish.
 
 ## Video 1 at a glance
 - **Title:** Your Bank Doesn't Have Your Money (Here's What It Does Instead)
